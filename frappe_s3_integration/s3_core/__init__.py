@@ -50,7 +50,7 @@ class S3Connection:
         self.s3_settings = frappe.get_single("AWS S3 Settings")
         self.setup_private_bucket()
         self.setup_public_bucket()
-        self.construct_bucket_restrictions
+        self.construct_bucket_restrictions()
 
     def setup_public_bucket(self):
         self.public_bucket= None
