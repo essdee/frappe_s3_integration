@@ -24,5 +24,9 @@ class AWSS3Settings(Document):
 			frappe.throw("The Following Exceptions Occured <br>"+"<br>".join(exceptions))
 
 	def on_update(self):
-		conn = getS3Connection()
-		conn.setup_s3_settings()
+		try:
+			conn = getS3Connection()
+			if conn:
+				conn.setup_s3_settings()
+		except Exception as e:
+			frappe.log_error()
