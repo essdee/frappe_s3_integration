@@ -1,0 +1,72 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2025-04-21 10:03:10.012748",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "bucket_name",
+  "default_folder",
+  "default_private_bucket",
+  "default_public_bucket",
+  "max_image_size",
+  "max_file_size"
+ ],
+ "fields": [
+  {
+   "fieldname": "bucket_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Bucket Name",
+   "reqd": 1
+  },
+  {
+   "fieldname": "default_folder",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Default Folder",
+   "reqd": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "default_private_bucket",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Default Private Bucket"
+  },
+  {
+   "default": "0",
+   "fieldname": "default_public_bucket",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Default Public Bucket"
+  },
+  {
+   "default": "350",
+   "fieldname": "max_image_size",
+   "fieldtype": "Int",
+   "label": "Max Image Size"
+  },
+  {
+   "default": "5120",
+   "fieldname": "max_file_size",
+   "fieldtype": "Int",
+   "label": "Max File Size"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "istable": 1,
+ "links": [],
+ "modified": "2025-04-23 16:58:20.979362",
+ "modified_by": "Administrator",
+ "module": "Frappe S3 Integration",
+ "name": "AWS S3 Settings Bucket Detail",
+ "owner": "Administrator",
+ "permissions": [],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

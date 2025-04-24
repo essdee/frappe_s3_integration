@@ -242,3 +242,18 @@ app_license = "mit"
 # 	"Logging DocType Name": 30  # days to retain logs
 # }
 
+fixtures = [
+    {
+        "doctype": "Custom Field",
+        "filters" : [
+            ["dt", "=", "File"],
+            ["name", 'in' , ['File-custom_s3_bucket_name', 'File-custom_is_s3_uploaded', 'File-custom_s3_key']]
+        ]
+    }
+]
+
+doc_events = {
+    "File": {
+        "on_trash": "frappe_s3_integration.s3_core.delete_file_from_s3",
+    }
+}

@@ -1,0 +1,67 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2025-04-21 09:58:06.367461",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "aws_key",
+  "aws_secret",
+  "region",
+  "s3_bucket_details"
+ ],
+ "fields": [
+  {
+   "fieldname": "aws_key",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Aws Key",
+   "reqd": 1
+  },
+  {
+   "fieldname": "aws_secret",
+   "fieldtype": "Password",
+   "in_list_view": 1,
+   "label": "Aws Secret",
+   "reqd": 1
+  },
+  {
+   "fieldname": "region",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Region",
+   "reqd": 1
+  },
+  {
+   "fieldname": "s3_bucket_details",
+   "fieldtype": "Table",
+   "label": "S3 Bucket Details",
+   "options": "AWS S3 Settings Bucket Detail"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "issingle": 1,
+ "links": [],
+ "modified": "2025-04-21 10:17:13.805621",
+ "modified_by": "Administrator",
+ "module": "Frappe S3 Integration",
+ "name": "AWS S3 Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

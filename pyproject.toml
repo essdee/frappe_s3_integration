@@ -1,13 +1,15 @@
 [project]
 name = "frappe_s3_integration"
 authors = [
-    { name = "sakthi123msd@gmail.com", email = "sakthi123msd@gmail.com"}
+    { name = "Sakthi Kumar P", email = "sakthi123msd@gmail.com"}
 ]
 description = "Frappe application to integrate file operations with files"
 requires-python = ">=3.10"
 readme = "README.md"
 dynamic = ["version"]
 dependencies = [
+    "boto3==1.37.37",
+    "botocore==1.37.37",
     # "frappe~=15.0.0" # Installed and managed by bench.
 ]
 
