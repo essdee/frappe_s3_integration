@@ -257,3 +257,12 @@ doc_events = {
         "on_trash": "frappe_s3_integration.s3_core.delete_file_from_s3",
     }
 }
+
+
+scheduler_events = {
+    "cron": {
+        "*/2 * * * *": [
+            "frappe_s3_integration.frappe_s3_integration.image_optimization.optimization_scheduler.pending_optimization_logs",
+        ]
+    }
+}

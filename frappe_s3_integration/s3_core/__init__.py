@@ -160,7 +160,21 @@ class S3Connection:
         except Exception as e:
             frappe.log_error(f"Error uploading file: {str(e)}")
             return False
+    
+    def get_file_from_bucket(self, key, bucket_name):
+        object = self.connection.get_object(Bucket = bucket_name, Key=key)
+        return object
         
+
+    def update_file_in_bucket(self, file, bucket_name, key, allow_public = False):
+        
+        self.connection.upload_fileobj(
+            Fileobj=file,
+            Bucket=bucket_name,
+            Key = key,
+            ExtraArgs = {"ACL" : "public-read"} if allow_public else None
+        )
+
     def delete_file_from_bucket(self, file_name, bucket_name=None):
         """
         Delete a file from an S3 bucket.
