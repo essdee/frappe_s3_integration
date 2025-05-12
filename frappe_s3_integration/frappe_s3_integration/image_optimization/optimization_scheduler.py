@@ -42,7 +42,7 @@ def process_image_optimizations(doc, s3_service , settings):
 		update_message(doc, 'Failed', error_log=error_log.name)
 
 
-def optimize_image(content, content_type, max_width=1024, max_height=768, optimize=True, quality=85):
+def optimize_image(content, content_type, max_width=2560, max_height=1440, optimize=True, quality=85):
 	if content_type == "image/svg+xml":
 		return content
 
@@ -50,15 +50,23 @@ def optimize_image(content, content_type, max_width=1024, max_height=768, optimi
 		image = Image.open(io.BytesIO(content))
 		exif = image.getexif()
 		width, height = image.size
-		max_height = max(min(max_height, height * 0.8), 200)
-		max_width = max(min(max_width, width * 0.8), 200)
+		aspect_ratio = width / height
+		if width > max_width or height > max_height:
+			if aspect_ratio > (max_width / max_height):
+				new_width = max_width
+				new_height = int(max_width / aspect_ratio)
+			else:
+				new_height = max_height
+				new_width = int(max_height * aspect_ratio)
+		else:
+			new_width, new_height = width, height
+
 		image_format = content_type.split("/")[-1].upper()
 		if image_format in ["OCTET-STREAM", "X-OCTET-STREAM", "BINARY", "UNKNOWN"]:
 			image_format = image.format 
 		if not image_format:
 			image_format = "JPEG"
-		size = max_width, max_height
-		image.thumbnail(size, Image.Resampling.LANCZOS)
+		image.thumbnail((new_width, new_height), Image.Resampling.LANCZOS)
 
 		output = io.BytesIO()
 		image.save(
@@ -72,8 +80,6 @@ def optimize_image(content, content_type, max_width=1024, max_height=768, optimi
 		optimized_content = output.getvalue()
 		return optimized_content if len(optimized_content) < len(content) else content
 	except Exception as e:
-		import traceback
-		traceback.print_exc()
 		frappe.msgprint(frappe._("Failed to optimize image: {0}").format(str(e)))
 		return content
 
