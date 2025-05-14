@@ -23,4 +23,4 @@ def create_image_optimazation_log(ref_doctype, ref_docname, files_list):
 			"file" : i
 		})
 
-	doc.save()
+	doc.save(ignore_permissions=True)
