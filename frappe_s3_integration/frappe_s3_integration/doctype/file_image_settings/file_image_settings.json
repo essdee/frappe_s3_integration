@@ -1,0 +1,50 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2025-05-04 19:58:02.190356",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "optimize_images_in_s3",
+  "image_optimization_quantity"
+ ],
+ "fields": [
+  {
+   "default": "0",
+   "fieldname": "optimize_images_in_s3",
+   "fieldtype": "Check",
+   "label": "Optimize Images In S3"
+  },
+  {
+   "fieldname": "image_optimization_quantity",
+   "fieldtype": "Select",
+   "label": "Image Optimization Quantity",
+   "options": "100\n90\n80\n70\n60\n50"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "issingle": 1,
+ "links": [],
+ "modified": "2025-05-04 19:59:40.892760",
+ "modified_by": "Administrator",
+ "module": "Frappe S3 Integration",
+ "name": "File Image Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
