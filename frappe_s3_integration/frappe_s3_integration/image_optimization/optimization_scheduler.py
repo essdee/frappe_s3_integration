@@ -23,6 +23,8 @@ def process_image_optimizations(doc, s3_service , settings):
 	try:
 		update_message(doc, 'Processing')
 		for i in doc.optimisation_details:
+			if not frappe.db.exists("File", i.file):
+				continue
 			file_doc = frappe.get_doc("File", i.file)
 			if not file_doc.get('custom_is_s3_uploaded'):
 				i.before_optimization_size = file_doc.get('file_size')

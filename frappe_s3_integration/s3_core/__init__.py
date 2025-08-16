@@ -119,23 +119,23 @@ class S3Connection:
                 return i.get('default_folder')
         return 'uploads'
         
-    def upload_file_to_public_bucket(self, file_name, object_name=None):
+    def upload_file_to_public_bucket(self, file, folder = None):
         """
         Upload a file to an S3 bucket.
         """
         if not self.public_bucket:
             frappe.throw("No public bucket found in S3 Settings")
-        return self.upload_file_to_bucket(file_name, self.public_bucket, allow_public=True)
+        return self.upload_file_to_bucket(file, self.public_bucket, allow_public=True, folder=folder)
     
-    def upload_file_to_private_bucket(self, file):
+    def upload_file_to_private_bucket(self, file, folder = None):
         """
         Upload a file to an S3 bucket.
         """
         if not self.private_bucket:
             frappe.throw("No private bucket found in S3 Settings")
-        return self.upload_file_to_bucket(file, self.private_bucket, allow_public=False)
+        return self.upload_file_to_bucket(file, self.private_bucket, allow_public=False, folder= folder)
         
-    def upload_file_to_bucket(self, file, bucket_name=None, allow_public = False):
+    def upload_file_to_bucket(self, file, bucket_name=None, allow_public = False, folder = None):
         """
         Upload a file to an S3 bucket.
         """
@@ -144,7 +144,13 @@ class S3Connection:
         try:
             ext = file.filename.rsplit('.', 1)[-1] if '.' in file.filename else ''
             unique_filename = f"{uuid.uuid4()}.{ext}" if ext else str(uuid.uuid4())
-            key = f"{self.get_default_upload_folder(bucket_name=bucket_name)}/{unique_filename}"
+            key = f"{self.get_default_upload_folder(bucket_name=bucket_name)}"
+            if folder:
+                folder = str(folder)
+                if not folder.startswith('/'):
+                    folder = f"/{folder}"
+                key += folder
+            key += f"/{unique_filename}"
             self.connection.upload_fileobj(
                 Fileobj=file,
                 Bucket=bucket_name,
@@ -204,6 +210,30 @@ class S3Connection:
         if max_size < file_size:
             return True, max_size
         return False, max_size
+    
+
+def create_file_and_upload_to_s3(doctype, docname, file, is_public_bucket = True, folder = None):
+    connection = getS3Connection()
+    s3_resp = None
+    if is_public_bucket:
+        s3_resp = connection.upload_file_to_public_bucket(file, folder=folder)
+    else:
+        s3_resp = connection.upload_file_to_private_bucket(file, folder = folder)
+    if not s3_resp:
+        frappe.throw("Error uploading file to S3")
+    file_doc = frappe.new_doc("File")
+    file_doc.update({
+        "file_name": file.filename,
+        "file_url": s3_resp.get('file_url'),
+        "is_private": 0,
+        "attached_to_doctype": doctype,
+        "attached_to_name": docname,
+        "custom_s3_bucket_name" : s3_resp.get('bucket_name'),
+        "custom_s3_key" : s3_resp.get('key'),
+        "custom_is_s3_uploaded" : 1,
+    })
+    file_doc.save()
+    return file_doc.get('file_url'), file_doc.get('name')
         
 
         
