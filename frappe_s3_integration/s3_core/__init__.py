@@ -157,7 +157,8 @@ class S3Connection:
                 Key=key,
                 ExtraArgs={"ACL": "public-read"} if allow_public else None
             )
-            file_url = f"https://{bucket_name}.s3.amazonaws.com/{key}"
+            region = self.connection.meta.region_name
+            file_url = f"https://{bucket_name}.s3.dualstack.{region}.amazonaws.com/{key}"
             return {
                 "file_url": file_url,
                 "key" : key,
