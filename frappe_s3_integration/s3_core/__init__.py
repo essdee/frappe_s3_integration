@@ -35,6 +35,8 @@ class S3Connection:
 
     def __init__(self, *args, **kwargs):
         self.setup_s3_settings()
+        if self.s3_settings.disable_s3_operations:
+            return
         if not self.s3_settings.aws_key or not self.s3_settings.aws_secret:
             frappe.throw("Please set AWS Access Key ID and Secret Access Key in S3 Settings")
         if not self.s3_settings.region:

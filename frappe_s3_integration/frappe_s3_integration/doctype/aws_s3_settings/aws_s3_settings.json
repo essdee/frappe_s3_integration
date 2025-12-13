@@ -5,6 +5,7 @@
  "doctype": "DocType",
  "engine": "InnoDB",
  "field_order": [
+  "disable_s3_operations",
   "aws_key",
   "aws_secret",
   "region",
@@ -37,13 +38,19 @@
    "fieldtype": "Table",
    "label": "S3 Bucket Details",
    "options": "AWS S3 Settings Bucket Detail"
+  },
+  {
+   "default": "0",
+   "fieldname": "disable_s3_operations",
+   "fieldtype": "Check",
+   "label": "Disable S3 Operations"
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2025-04-21 10:17:13.805621",
+ "modified": "2025-12-13 11:52:28.341734",
  "modified_by": "Administrator",
  "module": "Frappe S3 Integration",
  "name": "AWS S3 Settings",
@@ -61,6 +68,7 @@
   }
  ],
  "row_format": "Dynamic",
+ "rows_threshold_for_grid_search": 20,
  "sort_field": "modified",
  "sort_order": "DESC",
  "states": []
