@@ -84,14 +84,18 @@ class S3Connection:
 			return self.bucket_restrictions[bucket_name]['image_max']
 		return self.bucket_restrictions[bucket_name]['file_max']
 	
-	def get_pre_signed_url(self, file, extra = {}):
-		s3_key, bucket_name, upload = frappe.db.get_value("File", file, fieldname=['custom_s3_key', 'custom_s3_bucket_name', 'custom_is_s3_uploaded'])
-		if not s3_key or not bucket_name or not upload:
+	def get_pre_signed_url(self, file, content_type=None):
+		file_doc = frappe.get_doc("File", file)
+		from frappe.core.doctype.file.file import has_permission as file_has_permission
+		if not file_has_permission(file_doc, "read"):
+			frappe.throw("You don't have permission to access this file", frappe.PermissionError)
+
+		if not file_doc.custom_s3_key or not file_doc.custom_s3_bucket_name or not file_doc.custom_is_s3_uploaded:
 			frappe.throw("Can't generate url for non s3 uploaded files")
 		return self.generate_temporary_url(
-			bucket_name=bucket_name,
-			key=s3_key,
-			extra=extra
+			bucket_name=file_doc.custom_s3_bucket_name,
+			key=file_doc.custom_s3_key,
+			content_type=content_type,
 		)
 	
 	def generate_temporary_url(
@@ -100,7 +104,7 @@ class S3Connection:
 		key,
 		expires_in=3600,
 		inline=True,
-		extra = {} 
+		content_type=None,
 	):
 		"""
 		Generate a temporary (pre-signed) URL to access a file.
@@ -117,7 +121,8 @@ class S3Connection:
 
 			if inline:
 				params["ResponseContentDisposition"] = "inline"
-			params.update(extra)
+			if content_type:
+				params["ResponseContentType"] = content_type
 
 			url = self.connection.generate_presigned_url(
 				ClientMethod="get_object",
