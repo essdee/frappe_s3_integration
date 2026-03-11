@@ -4,3 +4,5 @@
 
 [post_model_sync]
 # Patches added in this section will be executed after doctypes are migrated
+frappe_s3_integration.patches.v1_0.migrate_s3_urls_to_proxy
+frappe_s3_integration.patches.v1_0.re_migrate_s3_urls_with_filename

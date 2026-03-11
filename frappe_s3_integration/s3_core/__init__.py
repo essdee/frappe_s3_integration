@@ -202,10 +202,11 @@ class S3Connection:
 			unique_filename = f"{uuid.uuid4()}.{ext}" if ext else str(uuid.uuid4())
 			key = f"{self.get_default_upload_folder(bucket_name=bucket_name)}"
 			if folder:
-				folder = str(folder)
-				if not folder.startswith('/'):
-					folder = f"/{folder}"
-				key += folder
+				folder = str(folder).strip("/")
+				# Prevent path traversal
+				folder = folder.replace("..", "").replace("//", "/")
+				if folder:
+					key += f"/{folder}"
 			key += f"/{unique_filename}"
 			self.connection.upload_fileobj(
 				Fileobj=file,
@@ -269,28 +270,31 @@ class S3Connection:
 		return False, max_size
 	
 
-def create_file_and_upload_to_s3(doctype, docname, file, is_public_bucket = True, folder = None):
+def create_file_and_upload_to_s3(doctype, docname, file, is_public_bucket=True, folder=None):
 	connection = getS3Connection()
 	s3_resp = None
 	if is_public_bucket:
 		s3_resp = connection.upload_file_to_public_bucket(file, folder=folder)
 	else:
-		s3_resp = connection.upload_file_to_private_bucket(file, folder = folder)
+		s3_resp = connection.upload_file_to_private_bucket(file, folder=folder)
 	if not s3_resp:
 		frappe.throw("Error uploading file to S3")
 	file_doc = frappe.new_doc("File")
 	file_doc.update({
 		"file_name": file.filename,
 		"file_url": s3_resp.get('file_url'),
-		"is_private": 0,
+		"is_private": 0 if is_public_bucket else 1,
 		"attached_to_doctype": doctype,
 		"attached_to_name": docname,
-		"custom_s3_bucket_name" : s3_resp.get('bucket_name'),
-		"custom_s3_key" : s3_resp.get('key'),
-		"custom_is_s3_uploaded" : 1,
+		"custom_s3_bucket_name": s3_resp.get('bucket_name'),
+		"custom_s3_key": s3_resp.get('key'),
+		"custom_is_s3_uploaded": 1,
 	})
 	file_doc.save()
-	return file_doc.get('file_url'), file_doc.get('name')
+	# Set proxy URL after save (need the doc name for the URL)
+	proxy_url = get_proxy_url(file_doc.name, file_doc.file_name)
+	file_doc.db_set("file_url", proxy_url, update_modified=False)
+	return proxy_url, file_doc.name
 		
 
 		
@@ -305,6 +309,60 @@ def delete_file_from_s3(doc, event, *args):
 		res = conn.delete_file_from_bucket(key, doc.get('custom_s3_bucket_name', None))
 		if res:
 			frappe.throw(f"Can't Delete the file view the <a href='/app/error-log/{res}'></a>")
+
+
+def get_proxy_url(file_id, file_name=None):
+	"""Generate the proxy URL to store in file_url.
+	Includes file_name in the path so Frappe's frontend can detect the file type
+	from the extension (used for image preview, video preview, etc.).
+	"""
+	from urllib.parse import quote
+	if file_name:
+		safe_name = quote(file_name, safe="")
+		return f"/api/method/frappe_s3_integration.s3_core.serve_file/{safe_name}?file_id={file_id}"
+	return f"/api/method/frappe_s3_integration.s3_core.serve_file?file_id={file_id}"
+
+
+@frappe.whitelist(allow_guest=True)
+def serve_file(file_id=None):
+	"""
+	Proxy endpoint for S3 files. Streams file content from S3
+	through the server with Frappe permission checks.
+	"""
+	if not file_id:
+		raise frappe.exceptions.NotFound
+
+	file_doc = frappe.db.get_value("File", file_id,
+		["name", "file_name", "is_private", "custom_s3_key",
+		 "custom_s3_bucket_name", "custom_is_s3_uploaded"],
+		as_dict=True)
+
+	if not file_doc or not file_doc.custom_is_s3_uploaded or not file_doc.custom_s3_key:
+		raise frappe.exceptions.NotFound
+
+	# Frappe's native file permission check
+	from frappe.core.doctype.file.file import has_permission as file_has_permission
+	full_doc = frappe.get_doc("File", file_id)
+	if not file_has_permission(full_doc, "read"):
+		raise frappe.PermissionError
+
+	conn = getS3Connection()
+
+	s3_obj = conn.get_file_from_bucket(
+		file_doc.custom_s3_key, file_doc.custom_s3_bucket_name
+	)
+	content = s3_obj["Body"].read()
+
+	# Determine content type: prefer S3 metadata, fall back to filename detection
+	import mimetypes
+	content_type = s3_obj.get("ContentType")
+	if not content_type or content_type in ("binary/octet-stream", "application/octet-stream"):
+		content_type = mimetypes.guess_type(file_doc.file_name)[0] or "application/octet-stream"
+
+	from werkzeug.wrappers import Response
+	response = Response(content, content_type=content_type)
+	response.headers["Content-Disposition"] = f'inline; filename="{file_doc.file_name}"'
+	return response
 
 
 connection = {}

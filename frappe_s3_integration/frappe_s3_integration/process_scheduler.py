@@ -1,11 +1,13 @@
 import frappe
-from frappe_s3_integration.s3_core import getS3Connection
+from frappe_s3_integration.s3_core import getS3Connection, get_proxy_url
 from frappe.utils.file_manager import get_file_path
 import os
 from werkzeug.datastructures import FileStorage
 
 @frappe.whitelist()
 def process_unuploaded_documents():
+    if not frappe.has_permission("AWS S3 Settings", "read"):
+        frappe.throw("Not permitted", frappe.PermissionError)
     conn = getS3Connection()
     if conn.s3_settings.disable_s3_operations:
         return
@@ -55,19 +57,27 @@ def migrate_file_to_s3(file_name, conn):
     if not s3_resp:
         raise Exception("S3 upload failed")
 
+    proxy_url = get_proxy_url(file.name, file.file_name)
     frappe.db.set_value(
         "File",
         file.name,
         {
-            "file_url": s3_resp["file_url"],
+            "file_url": proxy_url,
             "custom_s3_key": s3_resp["key"],
             "custom_s3_bucket_name": s3_resp["bucket_name"],
         },
     )
 
     file.reload()
-    if file.attached_to_doctype and file.attached_to_name and file.attached_to_field:
-        frappe.db.set_value(file.attached_to_doctype, file.attached_to_name, file.attached_to_field, file.file_url)
+    # Validate before updating attached doc
+    if (file.attached_to_doctype and file.attached_to_name and file.attached_to_field
+            and frappe.db.exists(file.attached_to_doctype, file.attached_to_name)):
+        meta = frappe.get_meta(file.attached_to_doctype)
+        if meta.has_field(file.attached_to_field):
+            frappe.db.set_value(
+                file.attached_to_doctype, file.attached_to_name,
+                file.attached_to_field, proxy_url
+            )
 
     try:
         os.remove(local_path)
@@ -76,5 +86,3 @@ def migrate_file_to_s3(file_name, conn):
             f"Failed to delete local file: {local_path}",
             "S3 Cleanup"
         )
-
-    
