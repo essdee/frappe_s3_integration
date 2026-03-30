@@ -19,7 +19,7 @@ def pending_optimization_logs():
 		process_image_optimizations(doc, s3_connection, setting)
 
 
-def process_image_optimizations(doc, s3_service , settings):
+def process_image_optimizations(doc, s3_service, settings):
 	try:
 		update_message(doc, 'Processing')
 		for i in doc.optimisation_details:
@@ -38,7 +38,7 @@ def process_image_optimizations(doc, s3_service , settings):
 			i.after_optimization_size = len(file_content)
 			file_content = io.BytesIO(file_content)
 			s3_service.update_file_in_bucket(file_content, file_doc.get('custom_s3_bucket_name'), file_doc.get('custom_s3_key'), False if file_doc.get('is_private') else True)
-			update_message(doc, 'Success')
+		update_message(doc, 'Success')
 	except Exception as e:
 		error_log = frappe.log_error()
 		update_message(doc, 'Failed', error_log=error_log.name)
@@ -65,24 +65,26 @@ def optimize_image(content, content_type, max_width=2560, max_height=1440, optim
 
 		image_format = content_type.split("/")[-1].upper()
 		if image_format in ["OCTET-STREAM", "X-OCTET-STREAM", "BINARY", "UNKNOWN"]:
-			image_format = image.format 
+			image_format = image.format
 		if not image_format:
 			image_format = "JPEG"
 		image.thumbnail((new_width, new_height), Image.Resampling.LANCZOS)
 
 		output = io.BytesIO()
-		image.save(
-			output,
-			format=image_format,
-			optimize=optimize,
-			quality=quality,
-			save_all=True if image_format == "gif" else None,
-			exif=exif,
-		)
+		save_kwargs = {
+			"format": image_format,
+			"optimize": optimize,
+			"quality": quality,
+		}
+		if image_format.upper() == "GIF":
+			save_kwargs["save_all"] = True
+		if image_format.upper() in ("JPEG", "JPG", "TIFF", "TIF"):
+			save_kwargs["exif"] = exif
+		image.save(output, **save_kwargs)
 		optimized_content = output.getvalue()
 		return optimized_content if len(optimized_content) < len(content) else content
 	except Exception as e:
-		frappe.msgprint(frappe._("Failed to optimize image: {0}").format(str(e)))
+		frappe.log_error(f"Failed to optimize image: {str(e)}", "Image Optimization")
 		return content
 
 

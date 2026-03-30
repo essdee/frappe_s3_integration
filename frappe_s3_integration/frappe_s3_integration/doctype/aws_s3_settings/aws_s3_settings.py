@@ -1,7 +1,7 @@
 # Copyright (c) 2025, sakthi123msd@gmail.com and contributors
 # For license information, please see license.txt
 
-from frappe_s3_integration.s3_core import getS3Connection
+from frappe_s3_integration.s3_core import invalidate_s3_connection
 import frappe
 from frappe.model.document import Document
 
@@ -16,17 +16,12 @@ class AWSS3Settings(Document):
 		for i in self.s3_bucket_details:
 			if i.default_private_bucket and i.default_public_bucket:
 				exceptions.append(f"for bucket {i.get('bucket_name')} has both public and private access which is invalid")
-			
+
 			if not i.default_private_bucket and not i.default_public_bucket:
 				exceptions.append(f"for bucket {i.get('bucket_name')} needs to be private or public")
-		
+
 		if exceptions and len(exceptions) > 0:
 			frappe.throw("The Following Exceptions Occured <br>"+"<br>".join(exceptions))
 
 	def on_update(self):
-		try:
-			conn = getS3Connection()
-			if conn:
-				conn.setup_s3_settings()
-		except Exception as e:
-			frappe.log_error()
+		invalidate_s3_connection()

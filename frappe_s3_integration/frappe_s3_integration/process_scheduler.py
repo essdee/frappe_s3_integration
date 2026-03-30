@@ -22,7 +22,9 @@ def process_unuploaded_documents():
     for f in files:
         try:
             migrate_file_to_s3(f.name, conn)
+            frappe.db.commit()
         except Exception:
+            frappe.db.rollback()
             frappe.log_error(
                 frappe.get_traceback(),
                 f"S3 upload failed for File {f.name}"
@@ -38,6 +40,13 @@ def migrate_file_to_s3(file_name, conn):
     if not os.path.exists(local_path):
         frappe.log_error(
             f"Local file missing: {local_path}",
+            "S3 Migration"
+        )
+        return
+
+    if os.path.getsize(local_path) == 0:
+        frappe.log_error(
+            f"Local file is empty: {local_path}",
             "S3 Migration"
         )
         return
@@ -58,15 +67,14 @@ def migrate_file_to_s3(file_name, conn):
         raise Exception("S3 upload failed")
 
     proxy_url = get_proxy_url(file.name, file.file_name)
-    frappe.db.set_value(
-        "File",
-        file.name,
-        {
-            "file_url": proxy_url,
-            "custom_s3_key": s3_resp["key"],
-            "custom_s3_bucket_name": s3_resp["bucket_name"],
-        },
-    )
+    update_fields = {
+        "file_url": proxy_url,
+        "custom_s3_key": s3_resp["key"],
+        "custom_s3_bucket_name": s3_resp["bucket_name"],
+    }
+    if s3_resp.get("content_hash"):
+        update_fields["content_hash"] = s3_resp["content_hash"]
+    frappe.db.set_value("File", file.name, update_fields)
 
     file.reload()
     # Validate before updating attached doc

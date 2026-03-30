@@ -1,5 +1,6 @@
 
 import uuid
+import hashlib
 import boto3 as s3
 import frappe
 from botocore.exceptions import ClientError
@@ -10,10 +11,16 @@ def getS3Connection():
 			It is used to create an S3 connection object.
 		"""
 		global connection
-		site_name = frappe.get_conf().site_name
+		site_name = frappe.local.site
 		if site_name not in connection:
 			connection[site_name] = S3Connection()
 		return connection[site_name]
+
+def invalidate_s3_connection():
+		"""Remove the cached S3 connection for the current site so it is recreated on next use."""
+		global connection
+		site_name = frappe.local.site
+		connection.pop(site_name, None)
 
 image_extensions = [
 	"jpg",
@@ -36,6 +43,7 @@ class S3Connection:
 	"""
 
 	def __init__(self, *args, **kwargs):
+		self.connection = None
 		self.setup_s3_settings()
 		if self.s3_settings.disable_s3_operations:
 			return
@@ -79,7 +87,7 @@ class S3Connection:
 			}
 
 	def get_bucket_size(self, bucket_name, file):
-		ext = file.filename.rsplit('.', 1)[-1] if '.' in file.filename else ''
+		ext = file.filename.rsplit('.', 1)[-1].lower() if '.' in file.filename else ''
 		if ext in image_extensions:
 			return self.bucket_restrictions[bucket_name]['image_max']
 		return self.bucket_restrictions[bucket_name]['file_max']
@@ -197,6 +205,12 @@ class S3Connection:
 		"""
 		if not bucket_name:
 			frappe.throw("Please provide a bucket name")
+		# Validate file has content and compute content hash
+		content = file.stream.read()
+		if len(content) == 0:
+			frappe.throw("Cannot upload an empty file")
+		content_hash = hashlib.md5(content).hexdigest()
+		file.stream.seek(0)
 		try:
 			ext = file.filename.rsplit('.', 1)[-1] if '.' in file.filename else ''
 			unique_filename = f"{uuid.uuid4()}.{ext}" if ext else str(uuid.uuid4())
@@ -220,6 +234,7 @@ class S3Connection:
 				"file_url": file_url,
 				"key" : key,
 				"bucket_name" : bucket_name,
+				"content_hash": content_hash,
 			}
 		except Exception as e:
 			frappe.log_error(f"Error uploading file: {str(e)}")
@@ -289,6 +304,7 @@ def create_file_and_upload_to_s3(doctype, docname, file, is_public_bucket=True, 
 		"custom_s3_bucket_name": s3_resp.get('bucket_name'),
 		"custom_s3_key": s3_resp.get('key'),
 		"custom_is_s3_uploaded": 1,
+		"content_hash": s3_resp.get('content_hash'),
 	})
 	file_doc.save()
 	# Set proxy URL after save (need the doc name for the URL)
@@ -306,6 +322,14 @@ def delete_file_from_s3(doc, event, *args):
 			return
 		if conn.s3_settings.disable_s3_operations:
 			frappe.throw("Can't Delete the file, The File has uploaded to s3 please enable s3 settings to remove the file from s3 also")
+		# Skip S3 deletion if other File docs still reference the same key
+		other_refs = frappe.db.count("File", filters={
+			"custom_s3_key": key,
+			"custom_s3_bucket_name": doc.get('custom_s3_bucket_name'),
+			"name": ["!=", doc.name],
+		})
+		if other_refs > 0:
+			return
 		res = conn.delete_file_from_bucket(key, doc.get('custom_s3_bucket_name', None))
 		if res:
 			frappe.throw(f"Can't Delete the file view the <a href='/app/error-log/{res}'></a>")
@@ -340,18 +364,20 @@ def serve_file(file_id=None):
 	if not file_doc or not file_doc.custom_is_s3_uploaded or not file_doc.custom_s3_key:
 		raise frappe.exceptions.NotFound
 
-	# Frappe's native file permission check
-	from frappe.core.doctype.file.file import has_permission as file_has_permission
-	full_doc = frappe.get_doc("File", file_id)
-	if not file_has_permission(full_doc, "read"):
-		raise frappe.PermissionError
+	# Private files require login + Frappe permission check
+	if file_doc.is_private:
+		if frappe.session.user == "Guest":
+			raise frappe.PermissionError
+		from frappe.core.doctype.file.file import has_permission as file_has_permission
+		full_doc = frappe.get_doc("File", file_id)
+		if not file_has_permission(full_doc, "read"):
+			raise frappe.PermissionError
 
 	conn = getS3Connection()
 
 	s3_obj = conn.get_file_from_bucket(
 		file_doc.custom_s3_key, file_doc.custom_s3_bucket_name
 	)
-	content = s3_obj["Body"].read()
 
 	# Determine content type: prefer S3 metadata, fall back to filename detection
 	import mimetypes
@@ -360,7 +386,16 @@ def serve_file(file_id=None):
 		content_type = mimetypes.guess_type(file_doc.file_name)[0] or "application/octet-stream"
 
 	from werkzeug.wrappers import Response
-	response = Response(content, content_type=content_type)
+
+	def stream_body():
+		body = s3_obj["Body"]
+		while True:
+			chunk = body.read(8192)
+			if not chunk:
+				break
+			yield chunk
+
+	response = Response(stream_body(), content_type=content_type)
 	response.headers["Content-Disposition"] = f'inline; filename="{file_doc.file_name}"'
 	return response
 
