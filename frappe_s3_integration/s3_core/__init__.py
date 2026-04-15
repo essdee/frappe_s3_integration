@@ -350,8 +350,9 @@ def get_proxy_url(file_id, file_name=None):
 @frappe.whitelist(allow_guest=True)
 def serve_file(file_id=None):
 	"""
-	Proxy endpoint for S3 files. Streams file content from S3
-	through the server with Frappe permission checks.
+	Serve S3 files. For public files, redirects directly to the S3 URL
+	(no server proxying). For private files, streams through server
+	with Frappe permission checks.
 	"""
 	if not file_id:
 		raise frappe.exceptions.NotFound
@@ -364,7 +365,7 @@ def serve_file(file_id=None):
 	if not file_doc or not file_doc.custom_is_s3_uploaded or not file_doc.custom_s3_key:
 		raise frappe.exceptions.NotFound
 
-	# Private files require login + Frappe permission check
+	# Private files require login + Frappe permission check + proxy streaming
 	if file_doc.is_private:
 		if frappe.session.user == "Guest":
 			raise frappe.PermissionError
@@ -373,13 +374,25 @@ def serve_file(file_id=None):
 		if not file_has_permission(full_doc, "read"):
 			raise frappe.PermissionError
 
+		return _stream_from_s3(file_doc)
+
+	# Public files — redirect to direct S3 URL (no server bandwidth used)
+	conn = getS3Connection()
+	region = conn.connection.meta.region_name
+	s3_url = f"https://{file_doc.custom_s3_bucket_name}.s3.dualstack.{region}.amazonaws.com/{file_doc.custom_s3_key}"
+
+	from werkzeug.utils import redirect
+	return redirect(s3_url, code=302)
+
+
+def _stream_from_s3(file_doc):
+	"""Stream private file content from S3 through the server."""
 	conn = getS3Connection()
 
 	s3_obj = conn.get_file_from_bucket(
 		file_doc.custom_s3_key, file_doc.custom_s3_bucket_name
 	)
 
-	# Determine content type: prefer S3 metadata, fall back to filename detection
 	import mimetypes
 	content_type = s3_obj.get("ContentType")
 	if not content_type or content_type in ("binary/octet-stream", "application/octet-stream"):
