@@ -12,16 +12,28 @@ class AWSS3Settings(Document):
 		self.validate_buckets()
 
 	def validate_buckets(self):
+		# M4: keep Settings (and the disable_s3_operations kill-switch) saveable even
+		# with incomplete config, so the switch can always be toggled during an incident.
+		if self.disable_s3_operations:
+			return
 		exceptions = []
 		for i in self.s3_bucket_details:
 			if i.default_private_bucket and i.default_public_bucket:
-				exceptions.append(f"for bucket {i.get('bucket_name')} has both public and private access which is invalid")
-
+				exceptions.append(f"bucket {i.get('bucket_name')} is marked both public and private")
 			if not i.default_private_bucket and not i.default_public_bucket:
-				exceptions.append(f"for bucket {i.get('bucket_name')} needs to be private or public")
+				exceptions.append(f"bucket {i.get('bucket_name')} must be either public or private")
 
-		if exceptions and len(exceptions) > 0:
-			frappe.throw("The Following Exceptions Occured <br>"+"<br>".join(exceptions))
+		# At most one default of each type — prevents the ambiguous "first-match-wins"
+		# selection bug — without requiring both to exist (some sites run public-only).
+		publics = [i for i in self.s3_bucket_details if i.default_public_bucket]
+		privates = [i for i in self.s3_bucket_details if i.default_private_bucket]
+		if len(publics) > 1:
+			exceptions.append(f"only one default PUBLIC bucket is allowed (found {len(publics)})")
+		if len(privates) > 1:
+			exceptions.append(f"only one default PRIVATE bucket is allowed (found {len(privates)})")
+
+		if exceptions:
+			frappe.throw("The following problems were found:<br>" + "<br>".join(exceptions))
 
 	def on_update(self):
 		invalidate_s3_connection()

@@ -254,6 +254,8 @@ fixtures = [
 
 doc_events = {
     "File": {
+        "after_insert": "frappe_s3_integration.s3_core.flag_file_for_s3",
+        "on_update": "frappe_s3_integration.s3_core.handle_is_private_change",
         "on_trash": "frappe_s3_integration.s3_core.delete_file_from_s3",
     }
 }
@@ -261,11 +263,11 @@ doc_events = {
 
 scheduler_events = {
     "cron": {
-        "*/2 * * * *": [
-            "frappe_s3_integration.frappe_s3_integration.image_optimization.optimization_scheduler.pending_optimization_logs",
-        ],
-        "0 0 * * *" : [
+        "0 0 * * *": [
             "frappe_s3_integration.frappe_s3_integration.process_scheduler.process_unuploaded_documents"
+        ],
+        "0 1 * * *": [
+            "frappe_s3_integration.frappe_s3_integration.backup.backup_s3_buckets"
         ]
     }
 }

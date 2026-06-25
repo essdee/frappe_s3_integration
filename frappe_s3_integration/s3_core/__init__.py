@@ -1,9 +1,18 @@
 
 import uuid
 import hashlib
+import mimetypes
 import boto3 as s3
 import frappe
 from botocore.exceptions import ClientError
+
+
+def _guess_content_type(filename):
+	"""Best-effort MIME type from a filename; never returns None."""
+	if not filename:
+		return "application/octet-stream"
+	return mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
 
 def getS3Connection():
 		"""
@@ -205,11 +214,16 @@ class S3Connection:
 		"""
 		if not bucket_name:
 			frappe.throw("Please provide a bucket name")
-		# Validate file has content and compute content hash
-		content = file.stream.read()
-		if len(content) == 0:
+		# Validate non-empty + compute content hash WITHOUT loading the whole file in memory
+		file.stream.seek(0)
+		hasher = hashlib.md5()
+		total = 0
+		for chunk in iter(lambda: file.stream.read(8192), b""):
+			total += len(chunk)
+			hasher.update(chunk)
+		if total == 0:
 			frappe.throw("Cannot upload an empty file")
-		content_hash = hashlib.md5(content).hexdigest()
+		content_hash = hasher.hexdigest()
 		file.stream.seek(0)
 		try:
 			ext = file.filename.rsplit('.', 1)[-1] if '.' in file.filename else ''
@@ -222,11 +236,15 @@ class S3Connection:
 				if folder:
 					key += f"/{folder}"
 			key += f"/{unique_filename}"
+			content_type = getattr(file, "content_type", None) or _guess_content_type(file.filename)
+			extra_args = {"ContentType": content_type}
+			if allow_public:
+				extra_args["ACL"] = "public-read"
 			self.connection.upload_fileobj(
 				Fileobj=file,
 				Bucket=bucket_name,
 				Key=key,
-				ExtraArgs={"ACL": "public-read"} if allow_public else None
+				ExtraArgs=extra_args,
 			)
 			region = self.connection.meta.region_name
 			file_url = f"https://{bucket_name}.s3.dualstack.{region}.amazonaws.com/{key}"
@@ -243,16 +261,65 @@ class S3Connection:
 	def get_file_from_bucket(self, key, bucket_name):
 		object = self.connection.get_object(Bucket = bucket_name, Key=key)
 		return object
+
+	def verify_object(self, bucket_name, key, expected_size=None):
+		"""True only if the object exists (and, if given, its size matches).
+		Distinguishes a definite 404 (return False) from a transient error
+		(re-raise, so the caller rolls back + retries rather than deleting the
+		only local copy). Data-safety invariant 1."""
+		try:
+			resp = self.connection.head_object(Bucket=bucket_name, Key=key)
+		except ClientError as e:
+			code = str(e.response.get("Error", {}).get("Code", ""))
+			if code in ("404", "NoSuchKey", "NotFound"):
+				return False
+			raise
+		if expected_size is not None and resp.get("ContentLength") != expected_size:
+			return False
+		return True
+
+	def list_objects(self, bucket_name, prefix=None):
+		"""Yield every object dict ({'Key','Size',...}) in a bucket, paginated."""
+		paginator = self.connection.get_paginator("list_objects_v2")
+		kwargs = {"Bucket": bucket_name}
+		if prefix:
+			kwargs["Prefix"] = prefix
+		for page in paginator.paginate(**kwargs):
+			for obj in page.get("Contents", []):
+				yield obj
+
+	def download_object(self, bucket_name, key, dest_path):
+		"""Download one object to a local path (used by the read-only backup job)."""
+		self.connection.download_file(bucket_name, key, dest_path)
 		
 
-	def update_file_in_bucket(self, file, bucket_name, key, allow_public = False):
+	def update_file_in_bucket(self, file, bucket_name, key, allow_public=False, content_type=None):
 		
+		extra_args = {"ContentType": content_type or _guess_content_type(key)}
+		if allow_public:
+			extra_args["ACL"] = "public-read"
 		self.connection.upload_fileobj(
 			Fileobj=file,
 			Bucket=bucket_name,
-			Key = key,
-			ExtraArgs = {"ACL" : "public-read"} if allow_public else None
+			Key=key,
+			ExtraArgs=extra_args,
 		)
+
+	def copy_object_to_bucket(self, src_bucket, src_key, dest_bucket, filename, make_public):
+		"""Server-side copy of an object into another bucket (visibility toggle).
+		Returns the new key. Content-type is preserved (MetadataDirective defaults to COPY)."""
+		folder = self.get_default_upload_folder(dest_bucket)
+		ext = filename.rsplit(".", 1)[-1] if filename and "." in filename else ""
+		new_key = f"{folder}/{uuid.uuid4()}.{ext}" if ext else f"{folder}/{uuid.uuid4()}"
+		params = {
+			"Bucket": dest_bucket,
+			"Key": new_key,
+			"CopySource": {"Bucket": src_bucket, "Key": src_key},
+		}
+		if make_public:
+			params["ACL"] = "public-read"
+		self.connection.copy_object(**params)
+		return new_key
 
 	def delete_file_from_bucket(self, file_name, bucket_name=None):
 		"""
@@ -276,9 +343,10 @@ class S3Connection:
 		if not bucket:
 			frappe.throw("Setup the S3 Settings")
 		max_size = self.get_bucket_size(bucket_name=bucket, file=file)
+		if not max_size:
+			return False, max_size  # unset/0 limit means "no cap" — never reject everything
 		file.stream.seek(0, 2)
-		file_size = file.stream.tell()
-		file_size = file_size/ 1024
+		file_size = file.stream.tell() / 1024
 		file.stream.seek(0)
 		if max_size < file_size:
 			return True, max_size
@@ -287,6 +355,9 @@ class S3Connection:
 
 def create_file_and_upload_to_s3(doctype, docname, file, is_public_bucket=True, folder=None):
 	connection = getS3Connection()
+	oversize, max_size = connection.validate_file_size(file, is_public=is_public_bucket)
+	if oversize:
+		frappe.throw(f"{file.filename} exceeds the max allowed size of {max_size / 1024:.2f} MB for this bucket")
 	s3_resp = None
 	if is_public_bucket:
 		s3_resp = connection.upload_file_to_public_bucket(file, folder=folder)
@@ -311,9 +382,76 @@ def create_file_and_upload_to_s3(doctype, docname, file, is_public_bucket=True, 
 	proxy_url = get_proxy_url(file_doc.name, file_doc.file_name)
 	file_doc.db_set("file_url", proxy_url, update_modified=False)
 	return proxy_url, file_doc.name
-		
 
-		
+
+def flag_file_for_s3(doc, event=None, *args):
+	"""File.after_insert hook: capture every new LOCAL file for the midnight sweep.
+	Metadata-only; never touches S3 at request time (invariant 7)."""
+	if doc.get("is_folder"):
+		return
+	if doc.get("custom_is_s3_uploaded") or doc.get("custom_s3_key"):
+		return
+	file_url = doc.get("file_url") or ""
+	if not (file_url.startswith("/files/") or file_url.startswith("/private/files/")):
+		return
+	try:
+		if frappe.db.get_single_value("AWS S3 Settings", "disable_s3_operations"):
+			return
+	except Exception:
+		return
+	doc.db_set("custom_is_s3_uploaded", 1, update_modified=False)
+
+
+def handle_is_private_change(doc, event=None, *args):
+	"""File.on_update hook: when an S3-backed File's visibility flips, move its object
+	to the matching bucket (public<->private) and re-ACL, then drop the old object if
+	no other File still references it. Requires both default buckets to exist."""
+	if not (doc.get("custom_is_s3_uploaded") and doc.get("custom_s3_key")):
+		return
+	if not doc.has_value_changed("is_private"):
+		return
+	conn = getS3Connection()
+	# Best-effort: the visibility move must NEVER roll back the File.save(). If S3 is
+	# disabled or the matching bucket isn't configured, the is_private flip still
+	# persists; the object just stays put (logged where it matters).
+	if conn.s3_settings.disable_s3_operations:
+		return
+	make_public = not doc.is_private
+	dest_bucket = conn.public_bucket if make_public else conn.private_bucket
+	if not dest_bucket:
+		frappe.log_error(
+			f"is_private toggled on {doc.name} but no default "
+			f"{'public' if make_public else 'private'} bucket configured — S3 object not moved",
+			"S3 Visibility",
+		)
+		return
+	old_bucket, old_key = doc.custom_s3_bucket_name, doc.custom_s3_key
+	if dest_bucket == old_bucket:
+		return  # already in the correct bucket
+
+	new_key = conn.copy_object_to_bucket(old_bucket, old_key, dest_bucket, doc.file_name, make_public)
+	if not conn.verify_object(dest_bucket, new_key):
+		frappe.log_error(f"Failed to move {doc.name} to {dest_bucket} — S3 object not moved", "S3 Visibility")
+		return
+
+	frappe.db.set_value("File", doc.name, {
+		"custom_s3_bucket_name": dest_bucket,
+		"custom_s3_key": new_key,
+		"file_url": get_proxy_url(doc.name, doc.file_name),
+	})
+	doc.custom_s3_bucket_name = dest_bucket
+	doc.custom_s3_key = new_key
+
+	# Drop the old object only if no other File still references it (shared-blob safe).
+	others = frappe.db.count("File", filters={
+		"custom_s3_key": old_key,
+		"custom_s3_bucket_name": old_bucket,
+		"name": ["!=", doc.name],
+	})
+	if others == 0:
+		conn.delete_file_from_bucket(old_key, old_bucket)
+
+
 def delete_file_from_s3(doc, event, *args):
 	conn = getS3Connection()
 	if doc.get('custom_is_s3_uploaded', None):
@@ -376,9 +514,11 @@ def serve_file(file_id=None):
 
 		return _stream_from_s3(file_doc)
 
-	# Public files — redirect to direct S3 URL (no server bandwidth used)
+	# Public files — redirect to the direct S3 URL (no server bandwidth used).
+	# Build from settings (not conn.connection) so it still works when the
+	# disable_s3_operations kill switch is ON — public objects stay reachable.
 	conn = getS3Connection()
-	region = conn.connection.meta.region_name
+	region = conn.s3_settings.region
 	s3_url = f"https://{file_doc.custom_s3_bucket_name}.s3.dualstack.{region}.amazonaws.com/{file_doc.custom_s3_key}"
 
 	from werkzeug.utils import redirect
@@ -388,12 +528,20 @@ def serve_file(file_id=None):
 def _stream_from_s3(file_doc):
 	"""Stream private file content from S3 through the server."""
 	conn = getS3Connection()
+	if conn.s3_settings.disable_s3_operations:
+		from werkzeug.exceptions import ServiceUnavailable
+		raise ServiceUnavailable("S3 file access is temporarily disabled")
 
-	s3_obj = conn.get_file_from_bucket(
-		file_doc.custom_s3_key, file_doc.custom_s3_bucket_name
-	)
+	try:
+		s3_obj = conn.get_file_from_bucket(
+			file_doc.custom_s3_key, file_doc.custom_s3_bucket_name
+		)
+	except ClientError as e:
+		code = str(e.response.get("Error", {}).get("Code", ""))
+		if code in ("404", "NoSuchKey", "NoSuchBucket", "NotFound"):
+			raise frappe.exceptions.NotFound
+		raise
 
-	import mimetypes
 	content_type = s3_obj.get("ContentType")
 	if not content_type or content_type in ("binary/octet-stream", "application/octet-stream"):
 		content_type = mimetypes.guess_type(file_doc.file_name)[0] or "application/octet-stream"

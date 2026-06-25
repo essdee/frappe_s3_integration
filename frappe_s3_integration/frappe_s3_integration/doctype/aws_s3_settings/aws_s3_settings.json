@@ -9,7 +9,10 @@
   "aws_key",
   "aws_secret",
   "region",
-  "s3_bucket_details"
+  "s3_bucket_details",
+  "enable_bucket_backup",
+  "backup_directory",
+  "backup_retention_count"
  ],
  "fields": [
   {
@@ -41,6 +44,23 @@
    "fieldname": "disable_s3_operations",
    "fieldtype": "Check",
    "label": "Disable S3 Operations"
+  },
+  {
+   "default": "1",
+   "fieldname": "enable_bucket_backup",
+   "fieldtype": "Check",
+   "label": "Enable Nightly Bucket Backup"
+  },
+  {
+   "fieldname": "backup_directory",
+   "fieldtype": "Data",
+   "label": "Backup Directory (blank = site private/backups/s3)"
+  },
+  {
+   "default": "7",
+   "fieldname": "backup_retention_count",
+   "fieldtype": "Int",
+   "label": "Backup Retention (archives per bucket)"
   }
  ],
  "grid_page_length": 50,

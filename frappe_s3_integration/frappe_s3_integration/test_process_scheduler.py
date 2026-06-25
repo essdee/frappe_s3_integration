@@ -1,0 +1,179 @@
+# Copyright (c) 2026, sakthi123msd@gmail.com and Contributors
+# See license.txt
+
+import io
+from unittest.mock import MagicMock, patch
+
+import frappe
+from frappe.tests.utils import FrappeTestCase
+
+from frappe_s3_integration.frappe_s3_integration import process_scheduler as ps
+
+PKG = "frappe_s3_integration.frappe_s3_integration.process_scheduler"
+
+
+def _file(**kw):
+	d = dict(custom_s3_key="", is_private=1, file_name="a.png",
+	         file_url="/private/files/a.png", name="F1", content_hash="h1",
+	         attached_to_doctype=None, attached_to_name=None, attached_to_field=None)
+	d.update(kw)
+	m = MagicMock()
+	m.get.side_effect = d.get
+	for k, v in d.items():
+		setattr(m, k, v)
+	return m
+
+
+class TestMigrateSafety(FrappeTestCase):
+	def _run(self, conn, file, **over):
+		cfg = dict(local_path="/tmp/x", exists=True, getsize=5,
+		           migrated_sibling=None, other_unmigrated=False)
+		cfg.update(over)
+		with patch(f"{PKG}.frappe.get_doc", return_value=file), \
+		     patch(f"{PKG}._local_path", return_value=cfg["local_path"]), \
+		     patch(f"{PKG}.os.path.exists", return_value=cfg["exists"]), \
+		     patch(f"{PKG}.os.path.getsize", return_value=cfg["getsize"]), \
+		     patch(f"{PKG}.open", return_value=io.BytesIO(b"12345")), \
+		     patch(f"{PKG}._migrated_sibling", return_value=cfg["migrated_sibling"]), \
+		     patch(f"{PKG}._other_unmigrated_share", return_value=cfg["other_unmigrated"]), \
+		     patch(f"{PKG}._point_doc_at_s3") as point, \
+		     patch(f"{PKG}.frappe.db"), \
+		     patch(f"{PKG}.frappe.get_meta"), \
+		     patch(f"{PKG}.os.remove") as rm:
+			raised = None
+			try:
+				ps.migrate_file_to_s3("F1", conn)
+			except Exception as e:  # noqa: BLE001
+				raised = e
+			return rm, point, raised
+
+	def test_no_delete_when_verify_fails(self):
+		# M2: must actually REACH verify, then refuse to delete / commit the pointer.
+		conn = MagicMock()
+		conn.upload_file_to_private_bucket.return_value = {"key": "k", "bucket_name": "b", "content_hash": "h1"}
+		conn.verify_object.return_value = False
+		rm, point, raised = self._run(conn, _file())
+		self.assertIsNotNone(raised)
+		conn.verify_object.assert_called_once()
+		point.assert_not_called()
+		rm.assert_not_called()
+
+	def test_require_content_hash_before_verify(self):
+		# M8: no content hash -> raise BEFORE verify, never delete.
+		conn = MagicMock()
+		conn.upload_file_to_private_bucket.return_value = {"key": "k", "bucket_name": "b"}
+		rm, point, raised = self._run(conn, _file())
+		self.assertIsNotNone(raised)
+		conn.verify_object.assert_not_called()
+		rm.assert_not_called()
+
+	def test_shared_blob_not_deleted_while_sibling_unmigrated(self):
+		# M1: another File still needs the local blob -> keep it.
+		conn = MagicMock()
+		conn.upload_file_to_private_bucket.return_value = {"key": "k", "bucket_name": "b", "content_hash": "h1"}
+		conn.verify_object.return_value = True
+		rm, point, raised = self._run(conn, _file(), other_unmigrated=True)
+		self.assertIsNone(raised)
+		point.assert_called_once()
+		rm.assert_not_called()
+
+	def test_delete_when_unshared(self):
+		conn = MagicMock()
+		conn.upload_file_to_private_bucket.return_value = {"key": "k", "bucket_name": "b", "content_hash": "h1"}
+		conn.verify_object.return_value = True
+		rm, point, raised = self._run(conn, _file(), other_unmigrated=False)
+		self.assertIsNone(raised)
+		rm.assert_called_once()
+
+	def test_reuse_migrated_sibling_no_upload(self):
+		# M1: dedup -> reuse the verified sibling's S3 object, never re-upload.
+		conn = MagicMock()
+		conn.verify_object.return_value = True
+		sib = MagicMock(custom_s3_key="ks", custom_s3_bucket_name="bs")
+		f = _file()
+		rm, point, raised = self._run(conn, f, migrated_sibling=sib)
+		self.assertIsNone(raised)
+		conn.upload_file_to_private_bucket.assert_not_called()
+		point.assert_called_once_with(f, "ks", "bs")
+		rm.assert_called_once()
+
+	def test_heal_when_local_missing_with_sibling(self):
+		# N1: local bytes gone but a verified migrated sibling exists -> repoint, don't lose the doc.
+		conn = MagicMock()
+		conn.verify_object.return_value = True
+		sib = MagicMock(custom_s3_key="ks", custom_s3_bucket_name="bs")
+		f = _file()
+		rm, point, raised = self._run(conn, f, exists=False, migrated_sibling=sib)
+		self.assertIsNone(raised)
+		conn.upload_file_to_private_bucket.assert_not_called()
+		point.assert_called_once_with(f, "ks", "bs")  # actually repointed (not a no-op)
+		rm.assert_not_called()
+
+	def test_idempotent_when_already_keyed(self):
+		conn = MagicMock()
+		rm, point, raised = self._run(conn, _file(custom_s3_key="already"))
+		self.assertIsNone(raised)
+		conn.upload_file_to_private_bucket.assert_not_called()
+		point.assert_not_called()
+		rm.assert_not_called()
+
+	def test_backfills_missing_content_hash_before_dedup(self):
+		# Sakthi's "doesn't store the hash" gap: a File reaching the sweep with no
+		# content_hash must get one stored (dedup + delete guards depend on it).
+		conn = MagicMock()
+		conn.upload_file_to_private_bucket.return_value = {"key": "k", "bucket_name": "b", "content_hash": "h"}
+		conn.verify_object.return_value = True
+		f = _file(content_hash="")  # no hash stored
+		with patch(f"{PKG}.frappe.get_doc", return_value=f), \
+		     patch(f"{PKG}._local_path", return_value="/tmp/x"), \
+		     patch(f"{PKG}.os.path.exists", return_value=True), \
+		     patch(f"{PKG}.os.path.getsize", return_value=5), \
+		     patch(f"{PKG}.open", return_value=io.BytesIO(b"12345")), \
+		     patch(f"{PKG}._hash_local_file", return_value="BACKFILLED"), \
+		     patch(f"{PKG}._migrated_sibling", return_value=None), \
+		     patch(f"{PKG}._other_unmigrated_share", return_value=False), \
+		     patch(f"{PKG}._point_doc_at_s3"), \
+		     patch(f"{PKG}.frappe.db") as db, \
+		     patch(f"{PKG}.frappe.get_meta"), \
+		     patch(f"{PKG}.os.remove"):
+			ps.migrate_file_to_s3("F1", conn)
+		db.set_value.assert_any_call("File", "F1", "content_hash", "BACKFILLED", update_modified=False)
+		self.assertEqual(f.content_hash, "BACKFILLED")
+
+
+class TestSweepOrchestrator(FrappeTestCase):
+	def test_worker_rollback_and_continue_on_failure(self):
+		conn = MagicMock()
+		conn.s3_settings.disable_s3_operations = 0
+		calls = []
+
+		def fake_migrate(name, c):
+			calls.append(name)
+			if name == "F2":
+				raise Exception("boom")
+
+		with patch(f"{PKG}.getS3Connection", return_value=conn), \
+		     patch(f"{PKG}.frappe.get_all", return_value=[frappe._dict(name="F1"), frappe._dict(name="F2")]) as ga, \
+		     patch(f"{PKG}.migrate_file_to_s3", side_effect=fake_migrate), \
+		     patch(f"{PKG}.frappe.db") as db, \
+		     patch(f"{PKG}.frappe.log_error") as le:
+			ps.run_unuploaded_documents_sweep()
+
+		self.assertEqual(calls, ["F1", "F2"])      # continued past the failure
+		db.rollback.assert_called_once()            # rolled back only the failed one
+		le.assert_called_once()
+		filters = ga.call_args.kwargs.get("filters")
+		self.assertIn(["custom_s3_key", "in", ["", None]], filters)  # only unmigrated files
+
+	def test_entry_enqueues_long_queue_3h_dedup(self):
+		# The scheduler entry must offload to the long queue with a 3h timeout so a
+		# large migrate+remove backlog isn't killed by the default short timeout.
+		with patch(f"{PKG}.frappe.has_permission", return_value=True), \
+		     patch(f"{PKG}.frappe.enqueue") as enq:
+			ps.process_unuploaded_documents()
+		enq.assert_called_once()
+		self.assertIs(enq.call_args.args[0], ps.run_unuploaded_documents_sweep)
+		self.assertEqual(enq.call_args.kwargs["queue"], "long")
+		self.assertEqual(enq.call_args.kwargs["timeout"], 3 * 60 * 60)
+		self.assertTrue(enq.call_args.kwargs["deduplicate"])
+		self.assertTrue(enq.call_args.kwargs.get("job_id"))
