@@ -3,9 +3,10 @@ import os
 
 import frappe
 from frappe.utils import get_site_path
+from rq.timeouts import JobTimeoutException
 from werkzeug.datastructures import FileStorage
 
-from frappe_s3_integration.s3_core import getS3Connection, get_proxy_url, _guess_content_type
+from frappe_s3_integration.s3_core import getS3Connection, get_proxy_url, _guess_content_type, _s3_key_from_file_url
 
 
 def _hash_local_file(path):
@@ -64,20 +65,62 @@ def _point_doc_at_s3(file, key, bucket):
 	})
 
 
-SWEEP_TIMEOUT = 3 * 60 * 60  # 3 hours — migrating + deleting a large local-file backlog is slow
+SWEEP_TIMEOUT_FLOOR = 3 * 60 * 60             # never below the previous fixed budget
+SWEEP_TIMEOUT_CAP = 24 * 60 * 60              # a bad estimate must not pin a worker forever
+S3_THROUGHPUT_MBPS = 0.5                        # effective MB/s (~500 KB/s: conservative bench->S3 uplink)
+PER_FILE_OVERHEAD_S = 1.0                      # per-file fixed cost (get_doc + dedup + head + commit + rm)
+SWEEP_SAFETY_BUFFER = 2.0                      # slack for variance / retries / queue contention
+DEFAULT_UNKNOWN_FILE_SIZE = 10 * 1024 * 1024   # assumed bytes when size unknown and blob unstat-able
+
+
+def _pending_migration_stats():
+	"""(total_bytes, count) for local Files flagged for S3 but not yet migrated.
+	Trust file_size when >0; else stat the on-disk blob; else a realistic default."""
+	rows = frappe.get_all("File", filters=[
+		["custom_is_s3_uploaded", "=", 1],
+		["custom_s3_key", "in", ["", None]],
+	], fields=["file_url", "file_size"])
+	total = 0
+	for r in rows:
+		size = r.file_size or 0
+		if size <= 0:
+			path = _local_path(frappe._dict(file_url=r.file_url))
+			try:
+				size = os.path.getsize(path) if path and os.path.exists(path) else DEFAULT_UNKNOWN_FILE_SIZE
+			except OSError:
+				size = DEFAULT_UNKNOWN_FILE_SIZE
+		total += size
+	return total, len(rows)
+
+
+def _sweep_timeout():
+	"""Enqueue timeout sized to the actual backlog: MAX of byte vs per-file bottleneck,
+	times a safety buffer, clamped to [floor, cap]. All knobs overridable via site_config."""
+	conf = frappe.get_conf()
+	throughput = float(conf.get("s3_sweep_throughput_mbps") or S3_THROUGHPUT_MBPS)
+	per_file = float(conf.get("s3_sweep_per_file_overhead_s") or PER_FILE_OVERHEAD_S)
+	buffer_ = float(conf.get("s3_sweep_safety_buffer") or SWEEP_SAFETY_BUFFER)
+	floor_ = int(conf.get("s3_sweep_timeout_floor") or SWEEP_TIMEOUT_FLOOR)
+	cap_ = int(conf.get("s3_sweep_timeout_cap") or SWEEP_TIMEOUT_CAP)
+	total_bytes, count = _pending_migration_stats()
+	byte_seconds = total_bytes / (throughput * 1024 * 1024)
+	count_seconds = count * per_file
+	raw = max(byte_seconds, count_seconds) * buffer_
+	return int(min(cap_, max(floor_, raw)))
 
 
 @frappe.whitelist()
 def process_unuploaded_documents():
 	"""Scheduler entry (cron). Offload the migration sweep to the long queue with a
-	3-hour timeout so a large migrate+remove backlog isn't killed by the default
-	short timeout. Deduplicated so a slow run can't overlap the next night's run."""
+	timeout sized to the pending backlog (see _sweep_timeout) so a large migrate+remove
+	backlog isn't killed by the default short timeout. Deduplicated so a slow run can't
+	overlap the next night's run."""
 	if not frappe.has_permission("AWS S3 Settings", "read"):
 		frappe.throw("Not permitted", frappe.PermissionError)
 	frappe.enqueue(
 		run_unuploaded_documents_sweep,
 		queue="long",
-		timeout=SWEEP_TIMEOUT,
+		timeout=_sweep_timeout(),
 		job_id="frappe_s3_integration::migrate_sweep",
 		deduplicate=True,
 	)
@@ -97,6 +140,11 @@ def run_unuploaded_documents_sweep():
 	for f in files:
 		try:
 			migrate_file_to_s3(f.name, conn)
+		except JobTimeoutException:
+			# Deadline reached: stop cleanly instead of swallowing it and running
+			# unbounded. Remaining files resume next night (idempotent + dedup'd).
+			frappe.db.rollback()
+			raise
 		except Exception:
 			frappe.db.rollback()
 			frappe.log_error(frappe.get_traceback(), f"S3 upload failed for File {f.name}")
@@ -140,12 +188,14 @@ def migrate_file_to_s3(file_name, conn):
 		return
 
 	content_type = _guess_content_type(file.file_name)
+	# Mirror Frappe's own layout as the S3 key: files/<name> or private/files/<name>.
+	s3_key = _s3_key_from_file_url(file.file_url)
 	with open(local_path, "rb") as f:
 		file_obj = FileStorage(stream=f, filename=file.file_name, content_type=content_type)
 		if file.is_private:
-			s3_resp = conn.upload_file_to_private_bucket(file_obj)
+			s3_resp = conn.upload_file_to_private_bucket(file_obj, key=s3_key)
 		else:
-			s3_resp = conn.upload_file_to_public_bucket(file_obj)
+			s3_resp = conn.upload_file_to_public_bucket(file_obj, key=s3_key)
 
 	if not s3_resp or not s3_resp.get("content_hash"):
 		raise Exception("S3 upload failed or returned no content hash")  # M8

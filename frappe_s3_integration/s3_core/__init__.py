@@ -2,6 +2,10 @@
 import uuid
 import hashlib
 import mimetypes
+import os
+import re
+import unicodedata
+from urllib.parse import quote
 import boto3 as s3
 import frappe
 from botocore.exceptions import ClientError
@@ -12,6 +16,34 @@ def _guess_content_type(filename):
 	if not filename:
 		return "application/octet-stream"
 	return mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+
+def _s3_safe_filename(filename, fallback="file"):
+	"""S3-safe BASENAME that preserves the uploaded name as closely as possible
+	while guaranteeing no path traversal and a valid, length-capped key segment."""
+	name = os.path.basename(filename or "")
+	name = name.replace("\\", "").replace("\x00", "")
+	name = "".join(ch for ch in name if unicodedata.category(ch)[0] != "C")
+	name = name.strip().strip(".")
+	name = re.sub(r"[^\w.\-() ]", "_", name, flags=re.UNICODE)
+	name = re.sub(r"\s+", " ", name).strip()
+	if not name or name in (".", ".."):
+		name = fallback
+	if len(name) > 200:
+		root, ext = os.path.splitext(name)
+		name = root[:200 - len(ext)] + ext
+	return name
+
+
+def _s3_key_from_file_url(file_url):
+	"""Map a local File url to its S3 key, mirroring Frappe's own on-disk layout:
+	'/files/x.pdf' -> 'files/x.pdf', '/private/files/x.pdf' -> 'private/files/x.pdf'.
+	Returns None if it isn't a local /files path (traversal-safe)."""
+	url = (file_url or "").split("?", 1)[0]
+	if not (url.startswith("/files/") or url.startswith("/private/files/")):
+		return None
+	parts = [p for p in url.split("/") if p and p not in (".", "..")]
+	return "/".join(parts)
 
 
 def getS3Connection():
@@ -192,26 +224,32 @@ class S3Connection:
 				return i.get('default_folder')
 		return 'uploads'
 		
-	def upload_file_to_public_bucket(self, file, folder = None):
-		"""
-		Upload a file to an S3 bucket.
-		"""
+	def upload_file_to_public_bucket(self, file, key=None):
+		"""Upload to the default public bucket. `key` mirrors Frappe's path when known."""
 		if not self.public_bucket:
 			frappe.throw("No public bucket found in S3 Settings")
-		return self.upload_file_to_bucket(file, self.public_bucket, allow_public=True, folder=folder)
-	
-	def upload_file_to_private_bucket(self, file, folder = None):
-		"""
-		Upload a file to an S3 bucket.
-		"""
+		return self.upload_file_to_bucket(file, self.public_bucket, allow_public=True, key=key)
+
+	def upload_file_to_private_bucket(self, file, key=None):
+		"""Upload to the default private bucket. `key` mirrors Frappe's path when known."""
 		if not self.private_bucket:
 			frappe.throw("No private bucket found in S3 Settings")
-		return self.upload_file_to_bucket(file, self.private_bucket, allow_public=False, folder= folder)
-		
-	def upload_file_to_bucket(self, file, bucket_name=None, allow_public = False, folder = None):
-		"""
-		Upload a file to an S3 bucket.
-		"""
+		return self.upload_file_to_bucket(file, self.private_bucket, allow_public=False, key=key)
+
+	def _unique_key(self, bucket_name, key):
+		"""Frappe-style collision guard: if `key` already exists, insert a short random
+		suffix before the extension until it's free. Only needed for direct API uploads
+		that don't pass through Frappe's local-file dedup."""
+		candidate = key
+		while self.verify_object(bucket_name, candidate):
+			root, ext = os.path.splitext(key)
+			candidate = f"{root}{uuid.uuid4().hex[:6]}{ext}"
+		return candidate
+
+	def upload_file_to_bucket(self, file, bucket_name=None, allow_public = False, key=None):
+		"""Upload a file to an S3 bucket. `key` is the object key; when omitted it mirrors
+		Frappe's own layout — files/<name> (public) / private/files/<name> (private) — with
+		a collision-safe suffix, so the S3 path matches how Frappe stores the file."""
 		if not bucket_name:
 			frappe.throw("Please provide a bucket name")
 		# Validate non-empty + compute content hash WITHOUT loading the whole file in memory
@@ -226,16 +264,10 @@ class S3Connection:
 		content_hash = hasher.hexdigest()
 		file.stream.seek(0)
 		try:
-			ext = file.filename.rsplit('.', 1)[-1] if '.' in file.filename else ''
-			unique_filename = f"{uuid.uuid4()}.{ext}" if ext else str(uuid.uuid4())
-			key = f"{self.get_default_upload_folder(bucket_name=bucket_name)}"
-			if folder:
-				folder = str(folder).strip("/")
-				# Prevent path traversal
-				folder = folder.replace("..", "").replace("//", "/")
-				if folder:
-					key += f"/{folder}"
-			key += f"/{unique_filename}"
+			if not key:
+				# No Frappe path supplied (direct API upload): build one the Frappe way.
+				prefix = "files" if allow_public else "private/files"
+				key = self._unique_key(bucket_name, f"{prefix}/{_s3_safe_filename(file.filename)}")
 			content_type = getattr(file, "content_type", None) or _guess_content_type(file.filename)
 			extra_args = {"ContentType": content_type}
 			if allow_public:
@@ -247,7 +279,7 @@ class S3Connection:
 				ExtraArgs=extra_args,
 			)
 			region = self.connection.meta.region_name
-			file_url = f"https://{bucket_name}.s3.dualstack.{region}.amazonaws.com/{key}"
+			file_url = f"https://{bucket_name}.s3.dualstack.{region}.amazonaws.com/{quote(key, safe='/')}"
 			return {
 				"file_url": file_url,
 				"key" : key,
@@ -306,11 +338,12 @@ class S3Connection:
 		)
 
 	def copy_object_to_bucket(self, src_bucket, src_key, dest_bucket, filename, make_public):
-		"""Server-side copy of an object into another bucket (visibility toggle).
-		Returns the new key. Content-type is preserved (MetadataDirective defaults to COPY)."""
-		folder = self.get_default_upload_folder(dest_bucket)
-		ext = filename.rsplit(".", 1)[-1] if filename and "." in filename else ""
-		new_key = f"{folder}/{uuid.uuid4()}.{ext}" if ext else f"{folder}/{uuid.uuid4()}"
+		"""Server-side copy into another bucket (visibility toggle). Mirror Frappe: the
+		object moves between files/ and private/files/ keeping its filename, so the name
+		is stable across public<->private flips."""
+		basename = src_key.rsplit("/", 1)[-1] or _s3_safe_filename(filename)
+		prefix = "files" if make_public else "private/files"
+		new_key = f"{prefix}/{basename}"
 		params = {
 			"Bucket": dest_bucket,
 			"Key": new_key,
@@ -360,9 +393,9 @@ def create_file_and_upload_to_s3(doctype, docname, file, is_public_bucket=True, 
 		frappe.throw(f"{file.filename} exceeds the max allowed size of {max_size / 1024:.2f} MB for this bucket")
 	s3_resp = None
 	if is_public_bucket:
-		s3_resp = connection.upload_file_to_public_bucket(file, folder=folder)
+		s3_resp = connection.upload_file_to_public_bucket(file)
 	else:
-		s3_resp = connection.upload_file_to_private_bucket(file, folder=folder)
+		s3_resp = connection.upload_file_to_private_bucket(file)
 	if not s3_resp:
 		frappe.throw("Error uploading file to S3")
 	file_doc = frappe.new_doc("File")
@@ -519,7 +552,7 @@ def serve_file(file_id=None):
 	# disable_s3_operations kill switch is ON — public objects stay reachable.
 	conn = getS3Connection()
 	region = conn.s3_settings.region
-	s3_url = f"https://{file_doc.custom_s3_bucket_name}.s3.dualstack.{region}.amazonaws.com/{file_doc.custom_s3_key}"
+	s3_url = f"https://{file_doc.custom_s3_bucket_name}.s3.dualstack.{region}.amazonaws.com/{quote(file_doc.custom_s3_key, safe='/')}"
 
 	from werkzeug.utils import redirect
 	return redirect(s3_url, code=302)

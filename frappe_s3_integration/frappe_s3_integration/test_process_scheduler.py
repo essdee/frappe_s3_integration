@@ -165,15 +165,56 @@ class TestSweepOrchestrator(FrappeTestCase):
 		filters = ga.call_args.kwargs.get("filters")
 		self.assertIn(["custom_s3_key", "in", ["", None]], filters)  # only unmigrated files
 
-	def test_entry_enqueues_long_queue_3h_dedup(self):
-		# The scheduler entry must offload to the long queue with a 3h timeout so a
-		# large migrate+remove backlog isn't killed by the default short timeout.
+	def test_entry_enqueues_long_queue_dynamic_timeout_dedup(self):
+		# The scheduler entry must offload to the long queue with a backlog-sized
+		# timeout (see _sweep_timeout) so a large migrate+remove backlog isn't killed
+		# by the default short timeout. Deduplicated + on a stable job_id.
 		with patch(f"{PKG}.frappe.has_permission", return_value=True), \
+		     patch(f"{PKG}._sweep_timeout", return_value=4321) as swt, \
 		     patch(f"{PKG}.frappe.enqueue") as enq:
 			ps.process_unuploaded_documents()
+		swt.assert_called_once()
 		enq.assert_called_once()
 		self.assertIs(enq.call_args.args[0], ps.run_unuploaded_documents_sweep)
 		self.assertEqual(enq.call_args.kwargs["queue"], "long")
-		self.assertEqual(enq.call_args.kwargs["timeout"], 3 * 60 * 60)
+		self.assertEqual(enq.call_args.kwargs["timeout"], 4321)  # the dynamic value, not a fixed 3h
 		self.assertTrue(enq.call_args.kwargs["deduplicate"])
 		self.assertTrue(enq.call_args.kwargs.get("job_id"))
+
+	def test_sweep_timeout_floor_scale_and_cap(self):
+		# Dynamic timeout = clamp(max(bytes/throughput, count*overhead) * buffer, floor, cap).
+		def compute(total_bytes, count):
+			with patch(f"{PKG}.frappe.get_conf", return_value={}), \
+			     patch(f"{PKG}._pending_migration_stats", return_value=(total_bytes, count)):
+				return ps._sweep_timeout()
+		GB = 1024 ** 3
+		self.assertEqual(compute(0, 0), ps.SWEEP_TIMEOUT_FLOOR)              # empty backlog -> floor
+		# a byte backlog that lands mid-range regardless of the configured throughput
+		mid_secs = (ps.SWEEP_TIMEOUT_FLOOR + ps.SWEEP_TIMEOUT_CAP) / 2
+		mid_bytes = int(mid_secs / ps.SWEEP_SAFETY_BUFFER * ps.S3_THROUGHPUT_MBPS * 1024 * 1024)
+		big = compute(mid_bytes, 0)
+		self.assertGreater(big, ps.SWEEP_TIMEOUT_FLOOR)                     # byte backlog scales up
+		self.assertLess(big, ps.SWEEP_TIMEOUT_CAP)
+		self.assertEqual(compute(10000 * GB, 10), ps.SWEEP_TIMEOUT_CAP)     # huge -> clamped to cap
+		many = compute(0, 30000)                                           # many tiny files -> count-bound
+		self.assertGreater(many, ps.SWEEP_TIMEOUT_FLOOR)
+		self.assertLess(many, ps.SWEEP_TIMEOUT_CAP)
+
+	def test_sweep_stops_cleanly_on_job_timeout(self):
+		# A JobTimeoutException must PROPAGATE (deadline stops the sweep) and NOT be
+		# swallowed by the broad except — else the sweep runs past its budget unbounded.
+		conn = MagicMock()
+		conn.s3_settings.disable_s3_operations = 0
+
+		def fake_migrate(name, c):
+			raise ps.JobTimeoutException("deadline")
+
+		with patch(f"{PKG}.getS3Connection", return_value=conn), \
+		     patch(f"{PKG}.frappe.get_all", return_value=[frappe._dict(name="F1"), frappe._dict(name="F2")]), \
+		     patch(f"{PKG}.migrate_file_to_s3", side_effect=fake_migrate), \
+		     patch(f"{PKG}.frappe.db") as db, \
+		     patch(f"{PKG}.frappe.log_error") as le:
+			with self.assertRaises(ps.JobTimeoutException):
+				ps.run_unuploaded_documents_sweep()
+		db.rollback.assert_called_once()   # rolled back the in-flight file
+		le.assert_not_called()             # a timeout is not logged as an upload failure

@@ -252,6 +252,11 @@ fixtures = [
     }
 ]
 
+override_doctype_class = {
+    "File": "frappe_s3_integration.overrides.S3File"
+}
+
+
 doc_events = {
     "File": {
         "after_insert": "frappe_s3_integration.s3_core.flag_file_for_s3",

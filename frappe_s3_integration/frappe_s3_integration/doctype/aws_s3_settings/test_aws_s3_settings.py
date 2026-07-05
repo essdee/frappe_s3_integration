@@ -1,6 +1,8 @@
 # Copyright (c) 2025, sakthi123msd@gmail.com and Contributors
 # See license.txt
 
+import io
+import uuid
 from unittest.mock import MagicMock, patch
 
 import frappe
@@ -27,6 +29,57 @@ class TestS3Engine(FrappeTestCase):
 		self.assertEqual(s3_core._guess_content_type("a.pdf"), "application/pdf")
 		self.assertEqual(s3_core._guess_content_type("blob"), "application/octet-stream")
 		self.assertEqual(s3_core._guess_content_type(None), "application/octet-stream")
+
+	def test_s3_safe_filename_preserves_name_and_blocks_traversal(self):
+		# Issue 1: keep the uploaded name intact, but never allow a path segment.
+		f = s3_core._s3_safe_filename
+		self.assertEqual(f("invoice.pdf"), "invoice.pdf")               # real name preserved
+		self.assertEqual(f("My Report (final).xlsx"), "My Report (final).xlsx")
+		self.assertEqual(f("café résumé.pdf"), "café résumé.pdf")       # unicode kept as-is
+		self.assertEqual(f("../../etc/passwd"), "passwd")              # traversal stripped
+		self.assertEqual(f("/abs/secret.key"), "secret.key")           # basename only
+		self.assertNotIn("/", f("../../etc/passwd"))
+		self.assertEqual(f(".."), "file")                             # degenerate -> fallback
+		self.assertEqual(f(""), "file")
+		self.assertNotIn("\x00", f("a\x00b.pdf"))                      # control chars stripped
+		self.assertLessEqual(len(f("a" * 300 + ".pdf")), 200)          # length-capped
+
+	def test_s3_key_from_file_url_mirrors_frappe(self):
+		# Issue 1: S3 key mirrors Frappe's own on-disk path.
+		f = s3_core._s3_key_from_file_url
+		self.assertEqual(f("/files/a.png"), "files/a.png")
+		self.assertEqual(f("/private/files/a.png"), "private/files/a.png")
+		self.assertIsNone(f("/api/method/x.serve_file/a.png?file_id=Y"))  # proxy url, not a local path
+		self.assertIsNone(f(""))
+
+	def test_upload_key_mirrors_frappe_layout_when_no_key(self):
+		# Direct upload with no explicit key -> Frappe layout: files/<name> (public), flat.
+		c = self._conn()
+		c.connection.meta.region_name = "ap-south-1"
+		c.verify_object = MagicMock(return_value=False)   # no collision
+		file = MagicMock(filename="my file.pdf", content_type="application/pdf")
+		file.stream = io.BytesIO(b"12345")
+		res = c.upload_file_to_bucket(file, bucket_name="b", allow_public=True)
+		self.assertEqual(res["key"], "files/my file.pdf")             # flat, Frappe layout, real name
+		self.assertIn("files/my%20file.pdf", res["file_url"])         # percent-encoded url
+
+	def test_upload_uses_explicit_frappe_key_verbatim(self):
+		# The migration sweep passes the file's Frappe path as the key -> used as-is, no uuid.
+		c = self._conn()
+		c.connection.meta.region_name = "ap-south-1"
+		file = MagicMock(filename="x.pdf", content_type="application/pdf")
+		file.stream = io.BytesIO(b"12345")
+		res = c.upload_file_to_bucket(file, bucket_name="b", allow_public=False, key="private/files/x.pdf")
+		self.assertEqual(res["key"], "private/files/x.pdf")
+
+	def test_copy_object_moves_between_frappe_folders(self):
+		# Visibility flip mirrors Frappe: files/<name> <-> private/files/<name>, name kept.
+		c = self._conn()
+		to_private = c.copy_object_to_bucket("pub", "files/invoice.pdf", "prv", "invoice.pdf", make_public=False)
+		self.assertEqual(to_private, "private/files/invoice.pdf")
+		to_public = c.copy_object_to_bucket("prv", "private/files/invoice.pdf", "pub", "invoice.pdf", make_public=True)
+		self.assertEqual(to_public, "files/invoice.pdf")
+		self.assertEqual(c.connection.copy_object.call_count, 2)
 
 	def test_verify_size_match(self):
 		c = self._conn()
@@ -299,3 +352,37 @@ class TestServeResilience(FrappeTestCase):
 		with patch.object(s3_core, "getS3Connection", return_value=conn):
 			with self.assertRaises(frappe.exceptions.NotFound):
 				s3_core._stream_from_s3(fdoc)
+
+
+class TestS3FileOverride(FrappeTestCase):
+	"""File controller override: S3-backed files (serve_file proxy url) skip on-disk validation."""
+
+	PROXY = "/api/method/frappe_s3_integration.s3_core.serve_file/10697.jpg?file_id=abc"
+
+	def test_file_controller_is_overridden(self):
+		from frappe_s3_integration.overrides import S3File
+		doc = frappe.get_doc({"doctype": "File", "file_name": "x.png", "file_url": "/files/x.png"})
+		self.assertIsInstance(doc, S3File)
+
+	def test_validate_file_on_disk_skips_s3_proxy(self):
+		from frappe_s3_integration.overrides import S3File
+		# The reported failure was inside validate_file_on_disk -> get_full_path ->
+		# is_safe_path, raising "Cannot access file path" for the /api/method proxy url.
+		# The override must skip it cleanly (return None) instead of raising.
+		doc = frappe.get_doc({
+			"doctype": "File",
+			"file_name": "10697.jpg",
+			"file_url": self.PROXY,
+			"custom_is_s3_uploaded": 1,
+		})
+		self.assertIsInstance(doc, S3File)
+		self.assertIsNone(doc.validate_file_on_disk())
+
+	def test_local_file_still_validated_by_core(self):
+		from frappe_s3_integration.overrides import S3File
+		doc = frappe.get_doc({"doctype": "File", "file_name": "nope.png",
+		                      "file_url": "/files/nope-does-not-exist.png", "is_private": 0})
+		self.assertIsInstance(doc, S3File)
+		# not an S3 proxy url -> delegates to core, which rejects a missing local file
+		with self.assertRaises(Exception):
+			doc.validate_file_on_disk()
