@@ -1,6 +1,7 @@
 # Copyright (c) 2025, sakthi123msd@gmail.com and Contributors
 # See license.txt
 
+import base64
 import io
 import uuid
 from unittest.mock import MagicMock, patch
@@ -404,6 +405,25 @@ class TestS3FileOverride(FrappeTestCase):
 			content = doc.get_content()
 		conn.get_file_from_bucket.assert_called_once_with("private/files/Statement.xlsx", "b")
 		self.assertEqual(content, b"\x89PNG binary")  # binary stays bytes
+
+	def test_pdf_body_html_inlines_s3_proxy_image(self):
+		# The letterhead / private S3 image bug: frappe can't resolve our proxy url, so
+		# images go blank in PDF. The pdf_body_html hook base64-inlines them from S3.
+		from frappe_s3_integration.pdf_print import inline_s3_images
+		f = MagicMock(file_name="logo.png")
+		f.is_downloadable.return_value = True
+		f.get_content.return_value = b"PNGDATA"
+		html = '<div><img src="/api/method/frappe_s3_integration.s3_core.serve_file/logo.png?file_id=ABC"></div>'
+		with patch.object(frappe.db, "exists", return_value=True), \
+		     patch.object(frappe, "get_doc", return_value=f):
+			out = inline_s3_images(html)
+		self.assertIn("data:image/png;base64," + base64.b64encode(b"PNGDATA").decode(), out)
+		self.assertNotIn("serve_file", out)  # proxy url replaced
+
+	def test_pdf_body_html_leaves_non_s3_html_untouched(self):
+		from frappe_s3_integration.pdf_print import inline_s3_images
+		html = '<div><img src="/files/logo.png"></div>'
+		self.assertEqual(inline_s3_images(html), html)  # fast path, no change
 
 	def test_get_content_decodes_text_and_delegates_for_local(self):
 		from frappe_s3_integration.overrides import S3File

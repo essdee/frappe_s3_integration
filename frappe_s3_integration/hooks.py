@@ -276,3 +276,8 @@ scheduler_events = {
         ]
     }
 }
+
+
+# Base64-inline S3-backed images in print/PDF (letterhead + private images) via frappe's
+# pdf_body_html hook — see frappe_s3_integration/pdf_print.py.
+pdf_body_html = "frappe_s3_integration.pdf_print.pdf_body_html"
