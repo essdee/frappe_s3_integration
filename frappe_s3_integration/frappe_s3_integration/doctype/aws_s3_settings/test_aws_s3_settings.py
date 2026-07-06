@@ -420,9 +420,35 @@ class TestS3FileOverride(FrappeTestCase):
 		self.assertIn("data:image/png;base64," + base64.b64encode(b"PNGDATA").decode(), out)
 		self.assertNotIn("serve_file", out)  # proxy url replaced
 
+	def test_inlines_migrated_letterhead_local_url(self):
+		# The letterhead-blank bug: migrate_file_to_s3 rewrites the File's file_url to the
+		# proxy and DELETES the local file, but never rewrites HTML that hardcodes the old
+		# path — a Letter Head's content still says <img src="/files/Letter_Head.png">.
+		# Resolve that local url to the migrated File by name and inline it from S3.
+		from frappe_s3_integration.pdf_print import inline_s3_images
+		f = MagicMock(file_name="Letter_Head.png")
+		f.get.side_effect = lambda k, d=None: {
+			"custom_is_s3_uploaded": 1, "custom_s3_key": "files/Letter_Head.png"}.get(k, d)
+		f.is_downloadable.return_value = True
+		f.get_content.return_value = b"LHDATA"
+		html = '<div><img src="/files/Letter_Head.png"></div>'
+		with patch.object(frappe, "get_all", return_value=["FILE-0001"]), \
+		     patch.object(frappe, "get_doc", return_value=f):
+			out = inline_s3_images(html)
+		self.assertIn("data:image/png;base64," + base64.b64encode(b"LHDATA").decode(), out)
+		self.assertNotIn("/files/Letter_Head.png", out)  # stale local url replaced
+
+	def test_local_url_left_untouched_when_not_on_s3(self):
+		# A /files/ image that was NEVER migrated (no S3-backed File by that name) must be
+		# left exactly as-is — local files render fine; don't touch what isn't ours.
+		from frappe_s3_integration.pdf_print import inline_s3_images
+		html = '<div><img src="/files/plain_local.png"></div>'
+		with patch.object(frappe, "get_all", return_value=[]):
+			self.assertEqual(inline_s3_images(html), html)
+
 	def test_pdf_body_html_leaves_non_s3_html_untouched(self):
 		from frappe_s3_integration.pdf_print import inline_s3_images
-		html = '<div><img src="/files/logo.png"></div>'
+		html = '<div><img src="https://cdn.example.com/logo.png"></div>'
 		self.assertEqual(inline_s3_images(html), html)  # fast path, no change
 
 	def test_render_letterhead_override_inlines_s3_header(self):

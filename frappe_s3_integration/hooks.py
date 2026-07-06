@@ -279,8 +279,13 @@ scheduler_events = {
 
 
 # Base64-inline S3-backed images in print/PDF (letterhead + private images) via frappe's
-# pdf_body_html hook — see frappe_s3_integration/pdf_print.py.
+# pdf hooks — see frappe_s3_integration/pdf_print.py. pdf_body_html covers the document
+# body; pdf_header_html/pdf_footer_html cover the page header/footer, where a document
+# print's LETTERHEAD is rendered into a wkhtmltopdf --header-html temp file (otherwise a
+# migrated letterhead whose /files/ path was deleted comes out blank).
 pdf_body_html = "frappe_s3_integration.pdf_print.pdf_body_html"
+pdf_header_html = "frappe_s3_integration.pdf_print.pdf_header_html"
+pdf_footer_html = "frappe_s3_integration.pdf_print.pdf_footer_html"
 
 # Reports (General Ledger etc.) use a different PDF path than pdf_body_html — override
 # those whitelisted methods to inline S3 images too (fixes S3 letterhead blank in report PDFs).
