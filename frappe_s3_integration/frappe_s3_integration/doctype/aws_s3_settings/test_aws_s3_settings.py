@@ -386,3 +386,39 @@ class TestS3FileOverride(FrappeTestCase):
 		# not an S3 proxy url -> delegates to core, which rejects a missing local file
 		with self.assertRaises(Exception):
 			doc.validate_file_on_disk()
+
+	def test_get_content_fetches_s3_backed_file_from_s3(self):
+		from frappe_s3_integration.overrides import S3File
+		# S3-backed file (proxy url, no local copy): get_content must fetch from S3,
+		# not open() the proxy path (which raised FileNotFoundError in Bank Statement Import).
+		doc = frappe.get_doc({
+			"doctype": "File", "file_name": "Statement.xlsx", "file_url": self.PROXY,
+			"custom_is_s3_uploaded": 1, "custom_s3_key": "private/files/Statement.xlsx",
+			"custom_s3_bucket_name": "b", "is_private": 1,
+		})
+		self.assertIsInstance(doc, S3File)
+		conn = MagicMock()
+		conn.s3_settings.disable_s3_operations = 0
+		conn.get_file_from_bucket.return_value = {"Body": MagicMock(read=lambda: b"\x89PNG binary")}
+		with patch.object(s3_core, "getS3Connection", return_value=conn):
+			content = doc.get_content()
+		conn.get_file_from_bucket.assert_called_once_with("private/files/Statement.xlsx", "b")
+		self.assertEqual(content, b"\x89PNG binary")  # binary stays bytes
+
+	def test_get_content_decodes_text_and_delegates_for_local(self):
+		from frappe_s3_integration.overrides import S3File
+		# text content from S3 is decoded to str (mirrors core)
+		doc = frappe.get_doc({
+			"doctype": "File", "file_name": "a.csv", "file_url": self.PROXY,
+			"custom_is_s3_uploaded": 1, "custom_s3_key": "files/a.csv",
+			"custom_s3_bucket_name": "b", "is_private": 0,
+		})
+		conn = MagicMock()
+		conn.s3_settings.disable_s3_operations = 0
+		conn.get_file_from_bucket.return_value = {"Body": MagicMock(read=lambda: b"a,b,c")}
+		with patch.object(s3_core, "getS3Connection", return_value=conn):
+			self.assertEqual(doc.get_content(), "a,b,c")
+		# a non-S3 File must NOT touch S3 — delegates to core
+		local = frappe.get_doc({"doctype": "File", "file_name": "x", "content": "hello"})
+		self.assertIsInstance(local, S3File)
+		self.assertEqual(local.get_content(), "hello")
