@@ -425,6 +425,22 @@ class TestS3FileOverride(FrappeTestCase):
 		html = '<div><img src="/files/logo.png"></div>'
 		self.assertEqual(inline_s3_images(html), html)  # fast path, no change
 
+	def test_render_letterhead_override_inlines_s3_header(self):
+		# Reports (General Ledger etc.): the S3 letterhead was blank because reports don't
+		# use pdf_body_html. The render_letterhead_for_print override base64s its images.
+		from frappe_s3_integration import pdf_print
+		import frappe.utils.print_format as pf
+		proxy = '<img src="/api/method/frappe_s3_integration.s3_core.serve_file/lh.png?file_id=LH">'
+		f = MagicMock(file_name="lh.png")
+		f.is_downloadable.return_value = True
+		f.get_content.return_value = b"LHDATA"
+		with patch.object(pf, "render_letterhead_for_print", return_value={"header": proxy, "footer": ""}), \
+		     patch.object(frappe.db, "exists", return_value=True), \
+		     patch.object(frappe, "get_doc", return_value=f):
+			out = pdf_print.render_letterhead_for_print(letterhead="X")
+		self.assertIn("data:image/png;base64," + base64.b64encode(b"LHDATA").decode(), out["header"])
+		self.assertNotIn("serve_file", out["header"])  # proxy url replaced in the letterhead
+
 	def test_get_content_decodes_text_and_delegates_for_local(self):
 		from frappe_s3_integration.overrides import S3File
 		# text content from S3 is decoded to str (mirrors core)

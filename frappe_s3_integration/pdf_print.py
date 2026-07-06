@@ -63,3 +63,28 @@ def pdf_body_html(jenv=None, template=None, print_format=None, args=None, **kwar
 
 	html = _default(template=template, args=args)
 	return inline_s3_images(html)
+
+
+@frappe.whitelist()
+def report_to_pdf(html, orientation="Landscape"):
+	"""override_whitelisted_methods target for REPORTS (General Ledger etc.). Reports
+	don't go through the pdf_body_html hook, so inline S3 images here before the PDF is
+	built; then delegate to core."""
+	from frappe.utils.print_format import report_to_pdf as _default
+
+	return _default(inline_s3_images(html), orientation)
+
+
+@frappe.whitelist()
+def render_letterhead_for_print(letterhead=None, doc=None):
+	"""override_whitelisted_methods target: the report letterhead header/footer html is
+	rendered here — inline its S3 images so an S3 letterhead logo isn't blank in report
+	PDFs (this is the path that was still broken)."""
+	from frappe.utils.print_format import render_letterhead_for_print as _default
+
+	rendered = _default(letterhead=letterhead, doc=doc)
+	if isinstance(rendered, dict):
+		for key in ("header", "footer"):
+			if rendered.get(key):
+				rendered[key] = inline_s3_images(rendered[key])
+	return rendered
