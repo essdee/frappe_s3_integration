@@ -265,6 +265,11 @@ doc_events = {
     }
 }
 
+# Stale local urls (/files/<x> hardcoded in letterheads, rich text, old emails) keep
+# working after the local copy is deleted: requests that MISS local disk are redirected
+# to the S3 proxy. Existing files are still served by nginx/core untouched.
+before_request = ["frappe_s3_integration.local_fallback.redirect_missing_local_files"]
+
 
 scheduler_events = {
     "cron": {
