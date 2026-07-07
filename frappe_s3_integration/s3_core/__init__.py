@@ -279,7 +279,7 @@ class S3Connection:
 				ExtraArgs=extra_args,
 			)
 			region = self.connection.meta.region_name
-			file_url = f"https://{bucket_name}.s3.dualstack.{region}.amazonaws.com/{quote(key, safe='/')}"
+			file_url = _s3_https_url(bucket_name, key, region)
 			return {
 				"file_url": file_url,
 				"key" : key,
@@ -518,6 +518,17 @@ def get_proxy_url(file_id, file_name=None):
 	return f"/api/method/frappe_s3_integration.s3_core.serve_file?file_id={file_id}"
 
 
+def _s3_https_url(bucket, key, region):
+	"""Path-style S3 URL: https://s3.<region>.amazonaws.com/<bucket>/<key>.
+	Path-style (bucket in the PATH, not the hostname) is REQUIRED for buckets whose name
+	contains dots (e.g. hr.essdee.fit.public): a virtual-hosted url like
+	<bucket>.s3.<region>.amazonaws.com breaks HTTPS — the wildcard cert *.s3... doesn't
+	cover the extra dotted labels — so the browser fails / mis-redirects."""
+	from urllib.parse import quote
+
+	return f"https://s3.{region}.amazonaws.com/{bucket}/{quote(key, safe='/')}"
+
+
 @frappe.whitelist(allow_guest=True)
 def serve_file(file_id=None):
 	"""
@@ -552,7 +563,8 @@ def serve_file(file_id=None):
 	# disable_s3_operations kill switch is ON — public objects stay reachable.
 	conn = getS3Connection()
 	region = conn.s3_settings.region
-	s3_url = f"https://{file_doc.custom_s3_bucket_name}.s3.dualstack.{region}.amazonaws.com/{quote(file_doc.custom_s3_key, safe='/')}"
+	# Path-style url — dotted bucket names (hr.essdee.fit.public) can't use virtual-hosted.
+	s3_url = _s3_https_url(file_doc.custom_s3_bucket_name, file_doc.custom_s3_key, region)
 
 	from werkzeug.utils import redirect
 	return redirect(s3_url, code=302)

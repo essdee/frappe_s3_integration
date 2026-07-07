@@ -334,7 +334,16 @@ class TestServeResilience(FrappeTestCase):
 		     patch.object(s3_core, "getS3Connection", return_value=conn):
 			resp = s3_core.serve_file(file_id="F1")
 		self.assertEqual(resp.status_code, 302)
-		self.assertIn("pub.s3.dualstack.ap-south-1", resp.headers["Location"])
+		loc = resp.headers["Location"]
+		self.assertIn("s3.ap-south-1.amazonaws.com/pub/uploads/x.png", loc)  # path-style
+		self.assertNotIn("pub.s3", loc)  # bucket NOT in the hostname (dotted-bucket safe)
+
+	def test_public_url_is_path_style_for_dotted_bucket(self):
+		# Dotted bucket names (hr.essdee.fit.public) MUST use path-style — a virtual-hosted
+		# url (<bucket>.s3...) breaks HTTPS and redirects/crashes in the browser.
+		url = s3_core._s3_https_url("hr.essdee.fit.public", "files/012++(1).jpg", "ap-south-1")
+		self.assertTrue(url.startswith("https://s3.ap-south-1.amazonaws.com/hr.essdee.fit.public/"))
+		self.assertNotIn("hr.essdee.fit.public.s3", url)  # never in the hostname
 
 	def test_stream_raises_503_when_disabled(self):
 		from werkzeug.exceptions import ServiceUnavailable
