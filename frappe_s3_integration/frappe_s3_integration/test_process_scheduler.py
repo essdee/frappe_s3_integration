@@ -141,6 +141,142 @@ class TestMigrateSafety(FrappeTestCase):
 		self.assertEqual(f.content_hash, "BACKFILLED")
 
 
+class TestInvariant2Repoint(FrappeTestCase):
+	"""Invariant 2: once a file is on S3, the doc that attached it must serve the proxy url —
+	NOT a now-deleted /files/<x> path. Must hold on EVERY migration path + be singles-aware."""
+
+	def _repoint(self, file, issingle, has_field=True, exists=True, current="__match__"):
+		# By default the parent field still holds THIS file's own local url (the repoint case).
+		if current == "__match__":
+			current = file.file_url
+		meta = MagicMock(issingle=issingle)
+		meta.has_field.return_value = has_field
+		with patch(f"{PKG}.frappe.get_meta", return_value=meta), \
+		     patch(f"{PKG}.get_proxy_url", return_value="PROXY"), \
+		     patch(f"{PKG}.frappe.db.exists", return_value=exists), \
+		     patch(f"{PKG}.frappe.db.get_value", return_value=current), \
+		     patch(f"{PKG}.frappe.db.get_single_value", return_value=current), \
+		     patch(f"{PKG}.frappe.db.set_single_value") as ssv, \
+		     patch(f"{PKG}.frappe.db.set_value") as sv, \
+		     patch(f"{PKG}.frappe.db.commit") as commit, \
+		     patch(f"{PKG}.frappe.log_error"):
+			ps._repoint_attached(file)
+			return ssv, sv, commit
+
+	def test_single_uses_set_single_value(self):
+		# Website Settings.app_logo lives in tabSingles — a plain set_value is deprecated for it.
+		f = _file(attached_to_doctype="Website Settings",
+		          attached_to_name="Website Settings", attached_to_field="app_logo")
+		ssv, sv, commit = self._repoint(f, issingle=True)
+		ssv.assert_called_once_with("Website Settings", "app_logo", "PROXY", update_modified=False)
+		sv.assert_not_called()
+		commit.assert_called_once()
+
+	def test_regular_uses_set_value(self):
+		f = _file(attached_to_doctype="Employee", attached_to_name="EMP-1", attached_to_field="image")
+		ssv, sv, commit = self._repoint(f, issingle=False)
+		sv.assert_called_once_with("Employee", "EMP-1", "image", "PROXY", update_modified=False)
+		ssv.assert_not_called()
+		commit.assert_called_once()
+
+	def test_no_attach_is_noop(self):
+		ssv, sv, commit = self._repoint(_file(), issingle=False)  # attached_to_* all None
+		sv.assert_not_called()
+		ssv.assert_not_called()
+		commit.assert_not_called()
+
+	def test_missing_field_skips(self):
+		f = _file(attached_to_doctype="Employee", attached_to_name="EMP-1", attached_to_field="ghost")
+		ssv, sv, commit = self._repoint(f, issingle=False, has_field=False)
+		sv.assert_not_called()
+		commit.assert_not_called()
+
+	def test_regular_missing_row_skips(self):
+		# non-single whose parent row was deleted -> never write, never commit.
+		f = _file(attached_to_doctype="Employee", attached_to_name="GONE", attached_to_field="image")
+		ssv, sv, commit = self._repoint(f, issingle=False, exists=False)
+		sv.assert_not_called()
+		ssv.assert_not_called()
+		commit.assert_not_called()
+
+	def test_skips_when_field_moved_to_external_url(self):
+		# data-safety: user set the field to an external URL -> never clobber it.
+		f = _file(attached_to_doctype="Employee", attached_to_name="EMP-1", attached_to_field="image")
+		ssv, sv, commit = self._repoint(f, issingle=False, current="https://cdn.example.com/x.png")
+		sv.assert_not_called()
+		ssv.assert_not_called()
+		commit.assert_not_called()
+
+	def test_skips_when_field_cleared(self):
+		# user cleared the attachment -> don't resurrect it.
+		f = _file(attached_to_doctype="Employee", attached_to_name="EMP-1", attached_to_field="image")
+		ssv, sv, commit = self._repoint(f, issingle=False, current=None)
+		sv.assert_not_called()
+		commit.assert_not_called()
+
+	def test_skips_when_field_points_to_newer_file(self):
+		# an older orphan File still links this field; a NEWER file now owns it -> don't downgrade.
+		f = _file(attached_to_doctype="Employee", attached_to_name="EMP-1", attached_to_field="image",
+		          file_url="/private/files/old.png")
+		ssv, sv, commit = self._repoint(f, issingle=False, current="/private/files/new.png")
+		sv.assert_not_called()
+		ssv.assert_not_called()
+		commit.assert_not_called()
+
+	def test_single_skips_when_logo_replaced(self):
+		# app_logo was replaced by a newer logo file -> the older File must not restore the old one.
+		f = _file(attached_to_doctype="Website Settings", attached_to_name="Website Settings",
+		          attached_to_field="app_logo", file_url="/files/old_logo.png")
+		ssv, sv, commit = self._repoint(f, issingle=True, current="/files/new_logo.png")
+		ssv.assert_not_called()
+		commit.assert_not_called()
+
+	# ---- every migration path must invoke the repoint ---------------------------------
+	def _migrate(self, conn, file, **over):
+		cfg = dict(exists=True, getsize=5, migrated_sibling=None, other_unmigrated=False)
+		cfg.update(over)
+		with patch(f"{PKG}.frappe.get_doc", return_value=file), \
+		     patch(f"{PKG}._local_path", return_value="/tmp/x"), \
+		     patch(f"{PKG}.os.path.exists", return_value=cfg["exists"]), \
+		     patch(f"{PKG}.os.path.getsize", return_value=cfg["getsize"]), \
+		     patch(f"{PKG}.open", return_value=io.BytesIO(b"12345")), \
+		     patch(f"{PKG}._migrated_sibling", return_value=cfg["migrated_sibling"]), \
+		     patch(f"{PKG}._other_unmigrated_share", return_value=cfg["other_unmigrated"]), \
+		     patch(f"{PKG}._point_doc_at_s3"), \
+		     patch(f"{PKG}.frappe.db"), \
+		     patch(f"{PKG}.os.remove"), \
+		     patch(f"{PKG}._repoint_attached") as rep:
+			ps.migrate_file_to_s3("F1", conn)
+		return rep
+
+	def test_normal_upload_path_repoints(self):
+		conn = MagicMock()
+		conn.upload_file_to_private_bucket.return_value = {"key": "k", "bucket_name": "b", "content_hash": "h1"}
+		conn.verify_object.return_value = True
+		f = _file(attached_to_doctype="Employee", attached_to_name="EMP-1", attached_to_field="image")
+		rep = self._migrate(conn, f)
+		rep.assert_called_once_with(f)
+
+	def test_dedup_sibling_path_repoints(self):
+		# the 2nd employee sharing one image: reuse sibling's object AND fix its own field.
+		conn = MagicMock()
+		conn.verify_object.return_value = True
+		sib = MagicMock(custom_s3_key="ks", custom_s3_bucket_name="bs")
+		f = _file(attached_to_doctype="Employee", attached_to_name="EMP-2", attached_to_field="image")
+		rep = self._migrate(conn, f, migrated_sibling=sib)
+		rep.assert_called_once_with(f)
+
+	def test_local_heal_path_repoints(self):
+		# local bytes gone, healed from a migrated sibling -> still fix the attach field.
+		conn = MagicMock()
+		conn.verify_object.return_value = True
+		sib = MagicMock(custom_s3_key="ks", custom_s3_bucket_name="bs")
+		f = _file(attached_to_doctype="Website Settings",
+		          attached_to_name="Website Settings", attached_to_field="app_logo")
+		rep = self._migrate(conn, f, exists=False, migrated_sibling=sib)
+		rep.assert_called_once_with(f)
+
+
 class TestSweepOrchestrator(FrappeTestCase):
 	def test_worker_rollback_and_continue_on_failure(self):
 		conn = MagicMock()
@@ -156,12 +292,14 @@ class TestSweepOrchestrator(FrappeTestCase):
 		     patch(f"{PKG}.frappe.get_all", return_value=[frappe._dict(name="F1"), frappe._dict(name="F2")]) as ga, \
 		     patch(f"{PKG}.migrate_file_to_s3", side_effect=fake_migrate), \
 		     patch(f"{PKG}.frappe.db") as db, \
+		     patch(f"{PKG}.frappe.clear_cache") as cc, \
 		     patch(f"{PKG}.frappe.log_error") as le:
 			ps.run_unuploaded_documents_sweep()
 
 		self.assertEqual(calls, ["F1", "F2"])      # continued past the failure
 		db.rollback.assert_called_once()            # rolled back only the failed one
 		le.assert_called_once()
+		cc.assert_called_once()                     # cache refreshed once after the sweep
 		filters = ga.call_args.kwargs.get("filters")
 		self.assertIn(["custom_s3_key", "in", ["", None]], filters)  # only unmigrated files
 

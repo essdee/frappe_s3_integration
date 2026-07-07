@@ -65,6 +65,50 @@ def _point_doc_at_s3(file, key, bucket):
 	})
 
 
+def _repoint_attached(file):
+	"""Invariant 2: point the attached doc's Attach field at this file's S3 proxy url, so
+	the parent record (Website Settings.app_logo, Employee.image, ...) no longer serves a
+	now-deleted /files/<x> path. Called from EVERY migration path — the dedup shortcuts and
+	the local-heal path must repoint too, not just the fresh-upload path.
+
+	Identity-guarded: only overwrite the parent field when it STILL holds THIS file's own
+	pre-migration local url. Here file.file_url is still that local url — _point_doc_at_s3
+	writes the DB row, not the in-memory doc. This preserves an external URL, a cleared
+	field, or a NEWER attachment on the same field, and prevents repointing the field to an
+	OLDER sibling File that also links the same (doctype, name, field) — Frappe leaves the
+	old File's attached_to_field set when an Attach field is replaced.
+
+	Singles-aware: a Single doctype (e.g. Website Settings) stores values in tabSingles, so
+	repoint via set_single_value rather than the deprecated single-through-set_value route.
+	Best-effort + isolated commit — must never raise and roll back the durable S3 pointer (N2)."""
+	if not (file.attached_to_doctype and file.attached_to_field):
+		return
+	try:
+		meta = frappe.get_meta(file.attached_to_doctype)
+		if not meta.has_field(file.attached_to_field):
+			return
+		single = meta.issingle
+		if single:
+			current = frappe.db.get_single_value(file.attached_to_doctype, file.attached_to_field)
+		elif file.attached_to_name and frappe.db.exists(file.attached_to_doctype, file.attached_to_name):
+			current = frappe.db.get_value(file.attached_to_doctype, file.attached_to_name,
+			                              file.attached_to_field)
+		else:
+			return
+		if current != file.file_url:
+			return  # field moved on (external / cleared / newer file) — never clobber it
+		proxy = get_proxy_url(file.name, file.file_name)
+		if single:
+			frappe.db.set_single_value(file.attached_to_doctype, file.attached_to_field,
+			                           proxy, update_modified=False)
+		else:
+			frappe.db.set_value(file.attached_to_doctype, file.attached_to_name,
+			                    file.attached_to_field, proxy, update_modified=False)
+		frappe.db.commit()
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"S3 attached-doc repoint failed for {file.name}")
+
+
 SWEEP_TIMEOUT_FLOOR = 3 * 60 * 60             # never below the previous fixed budget
 SWEEP_TIMEOUT_CAP = 24 * 60 * 60              # a bad estimate must not pin a worker forever
 S3_THROUGHPUT_MBPS = 0.5                        # effective MB/s (~500 KB/s: conservative bench->S3 uplink)
@@ -148,6 +192,11 @@ def run_unuploaded_documents_sweep():
 		except Exception:
 			frappe.db.rollback()
 			frappe.log_error(frappe.get_traceback(), f"S3 upload failed for File {f.name}")
+	if files:
+		# A repointed Single (e.g. Website Settings.app_logo) is written straight to
+		# tabSingles, bypassing its on_update website-cache rebuild — refresh once so the
+		# new proxy url is served without a manual `bench clear-cache`.
+		frappe.clear_cache()
 
 
 def migrate_file_to_s3(file_name, conn):
@@ -163,6 +212,7 @@ def migrate_file_to_s3(file_name, conn):
 		if sib and conn.verify_object(sib.custom_s3_bucket_name, sib.custom_s3_key):
 			_point_doc_at_s3(file, sib.custom_s3_key, sib.custom_s3_bucket_name)
 			frappe.db.commit()
+			_repoint_attached(file)  # invariant 2: this doc's attach field too
 			return
 		frappe.log_error(f"Local file missing & no recoverable sibling: {file.name} ({local_path})", "S3 Migration")
 		return
@@ -184,6 +234,7 @@ def migrate_file_to_s3(file_name, conn):
 	if sib and conn.verify_object(sib.custom_s3_bucket_name, sib.custom_s3_key):
 		_point_doc_at_s3(file, sib.custom_s3_key, sib.custom_s3_bucket_name)
 		frappe.db.commit()
+		_repoint_attached(file)  # invariant 2: dedup'd sibling still owns its own attach field
 		_maybe_remove_local(file, local_path)
 		return
 
@@ -208,18 +259,8 @@ def migrate_file_to_s3(file_name, conn):
 	_point_doc_at_s3(file, s3_resp["key"], s3_resp["bucket_name"])
 	frappe.db.commit()
 
-	# Best-effort: repoint the attached-doc field. Non-fatal — must not roll back the pointer (N2).
-	try:
-		file.reload()
-		if (file.attached_to_doctype and file.attached_to_name and file.attached_to_field
-				and frappe.db.exists(file.attached_to_doctype, file.attached_to_name)):
-			meta = frappe.get_meta(file.attached_to_doctype)
-			if meta.has_field(file.attached_to_field):
-				frappe.db.set_value(file.attached_to_doctype, file.attached_to_name,
-				                    file.attached_to_field, get_proxy_url(file.name, file.file_name))
-				frappe.db.commit()
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), f"S3 attached-doc repoint failed for {file.name}")
+	# Invariant 2: repoint the attached doc's field (singles-aware, isolated non-fatal commit).
+	_repoint_attached(file)
 
 	_maybe_remove_local(file, local_path)
 

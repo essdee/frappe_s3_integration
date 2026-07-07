@@ -486,24 +486,31 @@ def handle_is_private_change(doc, event=None, *args):
 
 
 def delete_file_from_s3(doc, event, *args):
+	"""File.on_trash hook (invariant 3): remove the S3 object ONLY when this is the LAST
+	File doc referencing it — dedup'd siblings share one object, so deleting one File must
+	never break the others. Touches the S3 connection only for S3-backed files, so a
+	broken/unconfigured S3 setup can't block deleting ordinary local File docs — and,
+	intentionally, a shared-sibling delete (no S3 delete needed) also proceeds when the
+	connection is unavailable or the kill switch is on."""
+	if not doc.get('custom_is_s3_uploaded', None):
+		return
+	key = doc.get('custom_s3_key', None)
+	if not key:
+		return
+	# Skip S3 deletion if other File docs still reference the same object (shared blob).
+	other_refs = frappe.db.count("File", filters={
+		"custom_s3_key": key,
+		"custom_s3_bucket_name": doc.get('custom_s3_bucket_name'),
+		"name": ["!=", doc.name],
+	})
+	if other_refs > 0:
+		return
 	conn = getS3Connection()
-	if doc.get('custom_is_s3_uploaded', None):
-		key = doc.get('custom_s3_key', None)
-		if not key:
-			return
-		if conn.s3_settings.disable_s3_operations:
-			frappe.throw("Can't Delete the file, The File has uploaded to s3 please enable s3 settings to remove the file from s3 also")
-		# Skip S3 deletion if other File docs still reference the same key
-		other_refs = frappe.db.count("File", filters={
-			"custom_s3_key": key,
-			"custom_s3_bucket_name": doc.get('custom_s3_bucket_name'),
-			"name": ["!=", doc.name],
-		})
-		if other_refs > 0:
-			return
-		res = conn.delete_file_from_bucket(key, doc.get('custom_s3_bucket_name', None))
-		if res:
-			frappe.throw(f"Can't Delete the file view the <a href='/app/error-log/{res}'></a>")
+	if conn.s3_settings.disable_s3_operations:
+		frappe.throw("Can't Delete the file, The File has uploaded to s3 please enable s3 settings to remove the file from s3 also")
+	res = conn.delete_file_from_bucket(key, doc.get('custom_s3_bucket_name', None))
+	if res:
+		frappe.throw(f"Can't Delete the file view the <a href='/app/error-log/{res}'></a>")
 
 
 def get_proxy_url(file_id, file_name=None):

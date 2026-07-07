@@ -64,12 +64,30 @@ def _local_path(file_name, is_private):
 
 
 def _repoint_attached_field(f, proxy_url):
-	"""Best-effort: point the attached doc's Attach field at the new proxy url."""
-	if not (f.attached_to_doctype and f.attached_to_name and f.attached_to_field):
+	"""Best-effort: point the attached doc's Attach field at the new proxy url.
+	Singles-aware — a Single doctype (e.g. Website Settings) stores values in tabSingles,
+	so repoint via set_single_value rather than the deprecated single-through-set_value route.
+	Guarded — only rewrite a field that STILL serves a local /files path, so we never clobber
+	an external URL, a cleared field, or an already-proxied value (the proxy url is invariant
+	under re-keying, so an already-correct field needs no write)."""
+	if not (f.attached_to_doctype and f.attached_to_field):
 		return
 	try:
 		meta = frappe.get_meta(f.attached_to_doctype)
-		if meta.has_field(f.attached_to_field) and frappe.db.exists(f.attached_to_doctype, f.attached_to_name):
+		if not meta.has_field(f.attached_to_field):
+			return
+		single = meta.issingle
+		if single:
+			current = frappe.db.get_single_value(f.attached_to_doctype, f.attached_to_field)
+		elif f.attached_to_name and frappe.db.exists(f.attached_to_doctype, f.attached_to_name):
+			current = frappe.db.get_value(f.attached_to_doctype, f.attached_to_name, f.attached_to_field)
+		else:
+			return
+		if not _is_stale_local_url(current):
+			return
+		if single:
+			frappe.db.set_single_value(f.attached_to_doctype, f.attached_to_field, proxy_url, update_modified=False)
+		else:
 			frappe.db.set_value(
 				f.attached_to_doctype, f.attached_to_name,
 				f.attached_to_field, proxy_url, update_modified=False,
@@ -347,6 +365,306 @@ def _cleanup_local(dry_run=0):
 	print(
 		f"[s3 local-cleanup] {'DRY-RUN ' if dry_run else ''}done: scanned={len(files)} "
 		f"removed={removed} kept(size-mismatch)={kept} no_local={no_local} errors={errors}"
+	)
+
+
+# ---------------------------------------------------------------------------------------
+# Attach-field backfill — repoint stale Attach fields at already-migrated files (invariant 2).
+# Fixes docs whose Attach field STILL holds /files/<x> though the File is already on S3.
+# Covers the two gaps a pre-repoint migration left behind:
+#   • Single doctypes (Website Settings.app_logo) — updated via set_single_value.
+#   • dedup-shared blobs — the 2nd File doc reused a sibling's S3 object and never had its
+#     own attach field repointed.
+# Run:  bench --site <site> execute frappe_s3_integration.s3_normalize.enqueue_attach_backfill
+#   (dry run: append  --kwargs "{'dry_run': 1}")
+# SAFE + idempotent: only rewrites a field that STILL holds a local /files url; never touches
+# S3 or local disk (pure DB repoint to the file's own proxy url). Resumable (per-file commits).
+# ---------------------------------------------------------------------------------------
+
+ATTACH_BACKFILL_FILTERS = [
+	["custom_is_s3_uploaded", "=", 1],
+	["custom_s3_key", "is", "set"],
+	["attached_to_field", "is", "set"],
+]
+
+
+def _attach_backfill_count():
+	if "custom_s3_key" not in frappe.db.get_table_columns("File"):
+		return 0
+	return frappe.db.count("File", ATTACH_BACKFILL_FILTERS)
+
+
+def _is_stale_local_url(val):
+	"""A value still pointing at Frappe's local disk (the migration never repointed it)."""
+	return isinstance(val, str) and (val.startswith("/files/") or val.startswith("/private/files/"))
+
+
+def _expected_local_url(s3_key):
+	"""The pre-migration local url that a Frappe-layout S3 key was built from:
+	'private/files/x.pdf' -> '/private/files/x.pdf', 'files/x.png' -> '/files/x.png'.
+	Returns None for a mis-keyed object (normalize those first) — used as an IDENTITY
+	check so the field is only repointed when its stale local url is THIS file's own."""
+	if isinstance(s3_key, str) and s3_key.startswith(FRAPPE_PREFIXES):
+		return "/" + s3_key
+	return None
+
+
+def _current_attach_value(doctype, name, field, issingle):
+	"""Read the attach field's CURRENT value — singles come from tabSingles."""
+	if issingle:
+		return frappe.db.get_single_value(doctype, field)
+	return frappe.db.get_value(doctype, name, field)
+
+
+def enqueue_attach_backfill(dry_run=0):
+	"""Console entry point: size a timeout to the attached S3-backed file count and enqueue
+	the attach-field backfill worker on the `long` queue. Returns the plan (also printed)."""
+	dry_run = cint(dry_run)
+	count = _attach_backfill_count()
+	if not count:
+		print("[s3 attach-backfill] nothing to do — 0 attached S3-backed files")
+		return {"queued": 0}
+	timeout = _timeout_for(count)
+	frappe.enqueue(
+		"frappe_s3_integration.s3_normalize._backfill_attached_fields",
+		queue="long",
+		timeout=timeout,
+		job_name="s3_attach_backfill",
+		dry_run=dry_run,
+	)
+	print(
+		f"[s3 attach-backfill] queued scan of {count} attached S3-backed file(s) on 'long' queue "
+		f"(timeout={timeout}s, dry_run={bool(dry_run)})"
+	)
+	return {"queued": count, "timeout": timeout, "dry_run": bool(dry_run)}
+
+
+def _backfill_attached_fields(dry_run=0):
+	"""Background worker: for every S3-backed File whose attached field STILL holds a local
+	/files url, repoint that field at the File's proxy url. Singles-aware, idempotent, and
+	resumable (per-file commits). Never touches an already-proxied / external / empty value."""
+	dry_run = cint(dry_run)
+	if "custom_s3_key" not in frappe.db.get_table_columns("File"):
+		return
+
+	from frappe_s3_integration.s3_core import get_proxy_url
+
+	try:
+		from rq.timeouts import JobTimeoutException
+	except Exception:  # pragma: no cover
+		class JobTimeoutException(Exception):
+			pass
+
+	files = frappe.get_all(
+		"File",
+		filters=ATTACH_BACKFILL_FILTERS,
+		fields=["name", "file_name", "custom_s3_key",
+		        "attached_to_doctype", "attached_to_name", "attached_to_field"],
+	)
+
+	repointed = skipped = errors = 0
+	for f in files:
+		try:
+			dt, dn, fld = f.attached_to_doctype, f.attached_to_name, f.attached_to_field
+			if not (dt and fld):
+				skipped += 1
+				continue
+			meta = frappe.get_meta(dt)
+			if not meta.has_field(fld):
+				skipped += 1
+				continue
+			if not meta.issingle and not (dn and frappe.db.exists(dt, dn)):
+				skipped += 1
+				continue
+			current = _current_attach_value(dt, dn, fld, meta.issingle)
+			# IDENTITY guard: only fix a field that STILL holds THIS file's OWN pre-migration
+			# local url (== '/' + its Frappe-layout key). This skips an already-proxied value,
+			# an external URL, a cleared field — AND a newer sibling File on the same field, so
+			# we never repoint a record to an older attachment (Frappe leaves the old File's
+			# attached_to_field set when an Attach field is replaced).
+			expected = _expected_local_url(f.custom_s3_key)
+			if not expected or current != expected:
+				skipped += 1
+				continue
+			proxy = get_proxy_url(f.name, f.file_name)
+			if dry_run:
+				frappe.logger("s3").info(
+					f"[attach-backfill dry-run] would repoint {dt}/{dn}.{fld}: {current} -> proxy (File {f.name})")
+				repointed += 1
+				continue
+			if meta.issingle:
+				frappe.db.set_single_value(dt, fld, proxy, update_modified=False)
+			else:
+				frappe.db.set_value(dt, dn, fld, proxy, update_modified=False)
+			frappe.db.commit()
+			repointed += 1
+		except JobTimeoutException:
+			frappe.db.commit()
+			frappe.log_error(
+				f"attach-backfill: job timeout after {repointed} repointed — re-run to finish",
+				"S3 Attach Backfill")
+			raise
+		except Exception:
+			errors += 1
+			frappe.log_error(frappe.get_traceback(), f"S3 attach backfill failed for File {f.get('name')}")
+
+	if repointed and not dry_run:
+		# A repointed Single (Website Settings.app_logo) is written straight to tabSingles,
+		# bypassing its on_update website-cache rebuild — refresh once so the new proxy url
+		# is served immediately, without a manual `bench clear-cache`.
+		frappe.clear_cache()
+	print(
+		f"[s3 attach-backfill] {'DRY-RUN ' if dry_run else ''}done: scanned={len(files)} "
+		f"repointed={repointed} skipped={skipped} errors={errors}"
+	)
+
+
+# ---------------------------------------------------------------------------------------
+# content_hash backfill — every S3-backed File must carry a content_hash (invariant 4):
+# dedup (_migrated_sibling) and both shared-blob delete guards depend on it. New migrations
+# backfill it from local bytes, but files migrated BEFORE that fix (local copy now gone)
+# can still miss it. This tool hashes the LOCAL copy when one still exists, else streams
+# the S3 object (chunked md5 — matches Frappe's own content hashing).
+# Run:  bench --site <site> execute frappe_s3_integration.s3_normalize.enqueue_hash_backfill
+#   (dry run: append  --kwargs "{'dry_run': 1}")
+# SAFE: pure metadata write (content_hash only) — never touches S3 objects or local disk.
+# Idempotent + resumable (per-file commits; re-run skips files that already have a hash).
+# ---------------------------------------------------------------------------------------
+
+HASHLESS_FILTERS = [
+	["custom_is_s3_uploaded", "=", 1],
+	["custom_s3_key", "is", "set"],
+	["content_hash", "is", "not set"],
+]
+
+
+def _hashless_count():
+	if "custom_s3_key" not in frappe.db.get_table_columns("File"):
+		return 0
+	return frappe.db.count("File", HASHLESS_FILTERS)
+
+
+def _md5_of_stream(read):
+	"""Chunked md5 over any read(n) callable (local file or S3 body)."""
+	import hashlib
+
+	h = hashlib.md5()
+	while True:
+		chunk = read(8192)
+		if not chunk:
+			break
+		h.update(chunk)
+	return h.hexdigest()
+
+
+def _hash_backfill_timeout(count):
+	"""Streaming-hash is bandwidth-bound, so size the timeout by the backlog's BYTES as
+	well as its count (whichever is larger), clamped to the same cap. Overridable via
+	site_config (s3_normalize_throughput_mbps). The worker is resumable either way."""
+	rows = frappe.get_all("File", filters=HASHLESS_FILTERS, fields=["file_size"])
+	total_bytes = sum(r.file_size or 0 for r in rows)
+	throughput = float(frappe.conf.get("s3_normalize_throughput_mbps") or 0.5) * 1024 * 1024
+	byte_secs = int(total_bytes / throughput * 2)  # 2x safety buffer
+	cap = cint(frappe.conf.get("s3_normalize_timeout_cap")) or TIMEOUT_CAP
+	return min(max(_timeout_for(count), byte_secs), cap)
+
+
+def enqueue_hash_backfill(dry_run=0):
+	"""Console entry point: size a timeout to the hashless S3-backed backlog (count AND
+	bytes) and enqueue the content-hash backfill worker on the `long` queue."""
+	dry_run = cint(dry_run)
+	count = _hashless_count()
+	if not count:
+		print("[s3 hash-backfill] nothing to do — 0 S3-backed files without content_hash")
+		return {"queued": 0}
+	timeout = _hash_backfill_timeout(count)
+	frappe.enqueue(
+		"frappe_s3_integration.s3_normalize._backfill_content_hashes",
+		queue="long",
+		timeout=timeout,
+		job_name="s3_hash_backfill",
+		dry_run=dry_run,
+	)
+	print(
+		f"[s3 hash-backfill] queued {count} hashless S3-backed file(s) on 'long' queue "
+		f"(timeout={timeout}s, dry_run={bool(dry_run)})"
+	)
+	return {"queued": count, "timeout": timeout, "dry_run": bool(dry_run)}
+
+
+def _backfill_content_hashes(dry_run=0):
+	"""Background worker: compute + store content_hash for every S3-backed File missing one.
+	Prefers the local copy (fast, no bandwidth); else streams the S3 object. Idempotent +
+	resumable (per-file commits)."""
+	dry_run = cint(dry_run)
+	if "custom_s3_key" not in frappe.db.get_table_columns("File"):
+		return
+
+	from frappe_s3_integration.s3_core import getS3Connection
+
+	if frappe.db.get_single_value("AWS S3 Settings", "disable_s3_operations"):
+		frappe.log_error("S3 disabled — hash backfill skipped", "S3 Hash Backfill")
+		return
+	try:
+		conn = getS3Connection()
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "S3 Hash Backfill: connection failed — skipped")
+		return
+
+	try:
+		from rq.timeouts import JobTimeoutException
+	except Exception:  # pragma: no cover
+		class JobTimeoutException(Exception):
+			pass
+
+	files = frappe.get_all(
+		"File",
+		filters=HASHLESS_FILTERS,
+		fields=["name", "file_name", "is_private", "custom_s3_key", "custom_s3_bucket_name"],
+	)
+
+	hashed = errors = 0
+	for f in files:
+		try:
+			if not (f.custom_s3_key and f.custom_s3_bucket_name):
+				continue
+			if dry_run:
+				# report the candidate without downloading anything
+				frappe.logger("s3").info(
+					f"[s3 hash-backfill dry-run] would compute+store content_hash for File {f.name}")
+				hashed += 1
+				continue
+			digest = None
+			# 1) local copy still on disk AND size-matches the S3 object — hash it without
+			#    downloading. The hash must describe the bytes the File actually SERVES (S3),
+			#    so a stale/replaced local leftover must never be trusted blindly: a wrong
+			#    content_hash would poison dedup + the shared-blob delete guards.
+			if f.file_name:
+				local_abs = _local_path(f.file_name, f.is_private)
+				if os.path.isfile(local_abs) and conn.verify_object(
+						f.custom_s3_bucket_name, f.custom_s3_key,
+						expected_size=os.path.getsize(local_abs)):
+					with open(local_abs, "rb") as fh:
+						digest = _md5_of_stream(fh.read)
+			# 2) else stream the S3 object itself — always correct.
+			if digest is None:
+				obj = conn.get_file_from_bucket(f.custom_s3_key, f.custom_s3_bucket_name)
+				digest = _md5_of_stream(obj["Body"].read)
+			frappe.db.set_value("File", f.name, "content_hash", digest, update_modified=False)
+			frappe.db.commit()
+			hashed += 1
+		except JobTimeoutException:
+			frappe.db.commit()
+			frappe.log_error(
+				f"hash-backfill: job timeout after {hashed} hashed — re-run to finish", "S3 Hash Backfill")
+			raise
+		except Exception:
+			errors += 1
+			frappe.log_error(frappe.get_traceback(), f"S3 hash backfill failed for File {f.get('name')}")
+
+	print(
+		f"[s3 hash-backfill] {'DRY-RUN ' if dry_run else ''}done: candidates={len(files)} "
+		f"hashed={hashed} errors={errors}"
 	)
 
 
