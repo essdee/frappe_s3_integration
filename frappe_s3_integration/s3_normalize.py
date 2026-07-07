@@ -21,11 +21,18 @@ repoint every sibling before the old object is dropped; public copies keep publi
 """
 
 import os
+import re
 
 import frappe
 from frappe.utils import cint, get_files_path
 
 FRAPPE_PREFIXES = ("files/", "private/files/")
+
+# Every S3-backed file (used by the local-cleanup sweep).
+S3_BACKED_FILTERS = [
+	["custom_is_s3_uploaded", "=", 1],
+	["custom_s3_key", "is", "set"],
+]
 
 # Only mis-keyed, S3-backed files (key set and NOT already under files/ or private/files/).
 # A list-of-lists lets us put two `not like` conditions on the same column.
@@ -47,6 +54,13 @@ def _correct_key(file_name, is_private):
 
 	prefix = "private/files/" if is_private else "files/"
 	return prefix + _s3_safe_filename(file_name or "file")
+
+
+def _local_path(file_name, is_private):
+	"""On-disk path of a File's local copy, matching how Frappe names it on save
+	(save_file_on_filesystem sanitizes /\\%?# to _). Used to find + delete the local copy."""
+	safe = re.sub(r"[/\\%?#]", "_", file_name or "")
+	return get_files_path(safe, is_private=bool(is_private))
 
 
 def _repoint_attached_field(f, proxy_url):
@@ -207,7 +221,7 @@ def _normalize(dry_run=0):
 			# Target = S3: drop this re-keyed file's lingering LOCAL copy, but ONLY once the
 			# S3 object is verified present AND its size matches (never in neither place).
 			if f.file_name:
-				local_abs = get_files_path(f.file_name, is_private=bool(f.is_private))
+				local_abs = _local_path(f.file_name, f.is_private)
 				if os.path.exists(local_abs):
 					if conn.verify_object(bucket, key, expected_size=os.path.getsize(local_abs)):
 						os.remove(local_abs)
@@ -231,4 +245,106 @@ def _normalize(dry_run=0):
 	print(
 		f"[s3 normalize] {'DRY-RUN ' if dry_run else ''}done: candidates={len(files)} "
 		f"rekeyed={rekeyed} local_removed={local_removed} skipped={skipped} errors={errors}"
+	)
+
+
+# ---------------------------------------------------------------------------------------
+# Local-copy cleanup sweep — free disk by deleting local copies of files already on S3.
+# Run:  bench --site <site> execute frappe_s3_integration.s3_normalize.enqueue_local_cleanup
+# (dry run: append  --kwargs "{'dry_run': 1}"). SAFE: a local file is deleted only after
+# its S3 object is verified present WITH a matching size (never removes the only copy).
+# Independent of the key-normalization above — covers ALL S3-backed files, not just
+# mis-keyed ones. Idempotent + resumable (no DB writes; re-run skips already-gone locals).
+# ---------------------------------------------------------------------------------------
+
+def _s3_backed_count():
+	if "custom_s3_key" not in frappe.db.get_table_columns("File"):
+		return 0
+	return frappe.db.count("File", S3_BACKED_FILTERS)
+
+
+def enqueue_local_cleanup(dry_run=0):
+	"""Console entry point: size a timeout to the S3-backed file count and enqueue the
+	local-cleanup worker on the `long` queue."""
+	dry_run = cint(dry_run)
+	count = _s3_backed_count()
+	if not count:
+		print("[s3 local-cleanup] nothing to do — 0 S3-backed files")
+		return {"queued": 0}
+	timeout = _timeout_for(count)
+	frappe.enqueue(
+		"frappe_s3_integration.s3_normalize._cleanup_local",
+		queue="long",
+		timeout=timeout,
+		job_name="s3_local_cleanup",
+		dry_run=dry_run,
+	)
+	print(
+		f"[s3 local-cleanup] queued scan of {count} S3-backed file(s) on 'long' queue "
+		f"(timeout={timeout}s, dry_run={bool(dry_run)})"
+	)
+	return {"queued": count, "timeout": timeout, "dry_run": bool(dry_run)}
+
+
+def _cleanup_local(dry_run=0):
+	"""Background worker: delete the LOCAL copy of every S3-backed file, but ONLY after the
+	S3 object is verified present with a matching size. Never removes the last copy."""
+	dry_run = cint(dry_run)
+	if "custom_s3_key" not in frappe.db.get_table_columns("File"):
+		return
+
+	from frappe_s3_integration.s3_core import getS3Connection
+
+	if frappe.db.get_single_value("AWS S3 Settings", "disable_s3_operations"):
+		frappe.log_error("S3 disabled — local cleanup skipped", "S3 Local Cleanup")
+		return
+	try:
+		conn = getS3Connection()
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "S3 Local Cleanup: connection failed — skipped")
+		return
+
+	try:
+		from rq.timeouts import JobTimeoutException
+	except Exception:  # pragma: no cover
+		class JobTimeoutException(Exception):
+			pass
+
+	files = frappe.get_all(
+		"File",
+		filters=S3_BACKED_FILTERS,
+		fields=["name", "file_name", "is_private", "custom_s3_key", "custom_s3_bucket_name"],
+	)
+
+	removed = kept = no_local = errors = 0
+	for f in files:
+		try:
+			if not f.file_name or not f.custom_s3_key or not f.custom_s3_bucket_name:
+				continue
+			local_abs = _local_path(f.file_name, f.is_private)
+			if not os.path.exists(local_abs):
+				no_local += 1
+				continue
+			# Verify S3 has it (present + size match) before removing the local copy.
+			if conn.verify_object(f.custom_s3_bucket_name, f.custom_s3_key, expected_size=os.path.getsize(local_abs)):
+				if dry_run:
+					frappe.logger("s3").info(f"[s3 local-cleanup dry-run] would delete {local_abs} (File {f.name})")
+				else:
+					os.remove(local_abs)
+				removed += 1
+			else:
+				kept += 1
+				frappe.log_error(
+					f"local-cleanup: kept {local_abs} — S3 unverified/size-mismatch "
+					f"{f.custom_s3_bucket_name}/{f.custom_s3_key} (File {f.name})", "S3 Local Cleanup")
+		except JobTimeoutException:
+			frappe.log_error(f"local-cleanup: job timeout after {removed} removed — re-run to finish", "S3 Local Cleanup")
+			raise
+		except Exception:
+			errors += 1
+			frappe.log_error(frappe.get_traceback(), f"S3 local cleanup failed for File {f.get('name')}")
+
+	print(
+		f"[s3 local-cleanup] {'DRY-RUN ' if dry_run else ''}done: scanned={len(files)} "
+		f"removed={removed} kept(size-mismatch)={kept} no_local={no_local} errors={errors}"
 	)

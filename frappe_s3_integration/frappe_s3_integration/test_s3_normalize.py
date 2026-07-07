@@ -160,3 +160,52 @@ class TestS3Normalize(FrappeTestCase):
 			out = norm.enqueue_normalization()
 		enq.assert_not_called()
 		self.assertEqual(out["queued"], 0)
+
+	# ---- local-copy cleanup sweep ------------------------------------------------------
+	def _run_cleanup(self, files, conn, local_exists=False, local_size=5, disabled=0, dry_run=0):
+		with patch(f"{PMOD}.frappe.db.get_table_columns", return_value=["custom_s3_key"]), \
+		     patch(f"{PMOD}.frappe.db.get_single_value", return_value=disabled), \
+		     patch("frappe_s3_integration.s3_core.getS3Connection", return_value=conn), \
+		     patch(f"{PMOD}.frappe.get_all", return_value=files), \
+		     patch(f"{PMOD}.frappe.log_error"), \
+		     patch(f"{PMOD}.get_files_path", return_value="/tmp/local/a.jpg"), \
+		     patch(f"{PMOD}.os.path.exists", return_value=local_exists), \
+		     patch(f"{PMOD}.os.path.getsize", return_value=local_size), \
+		     patch(f"{PMOD}.os.remove") as rm:
+			norm._cleanup_local(dry_run=dry_run)
+		return rm
+
+	def test_local_cleanup_removes_verified_local(self):
+		conn = MagicMock()
+		conn.verify_object.return_value = True  # S3 present + size matches
+		rm = self._run_cleanup([_file(custom_s3_key="files/a.jpg", is_private=0)], conn, local_exists=True, local_size=5)
+		rm.assert_called_once_with("/tmp/local/a.jpg")
+
+	def test_local_cleanup_keeps_on_size_mismatch(self):
+		conn = MagicMock()
+		conn.verify_object.return_value = False  # S3 missing / size mismatch
+		rm = self._run_cleanup([_file(custom_s3_key="files/a.jpg")], conn, local_exists=True, local_size=99)
+		rm.assert_not_called()  # DATA SAFETY: never delete the only copy
+
+	def test_local_cleanup_dry_run_touches_nothing(self):
+		conn = MagicMock()
+		conn.verify_object.return_value = True
+		rm = self._run_cleanup([_file(custom_s3_key="files/a.jpg")], conn, local_exists=True, dry_run=1)
+		rm.assert_not_called()
+
+	def test_local_cleanup_no_local_is_a_noop(self):
+		conn = MagicMock()
+		conn.verify_object.return_value = True
+		rm = self._run_cleanup([_file(custom_s3_key="files/a.jpg")], conn, local_exists=False)
+		rm.assert_not_called()
+		conn.verify_object.assert_not_called()  # no S3 call when there's no local file
+
+	def test_enqueue_local_cleanup_queues_long_with_sized_timeout(self):
+		with patch(f"{PMOD}._s3_backed_count", return_value=500), \
+		     patch(f"{PMOD}.frappe.conf", {}), \
+		     patch(f"{PMOD}.frappe.enqueue") as enq:
+			out = norm.enqueue_local_cleanup()
+		enq.assert_called_once()
+		self.assertEqual(enq.call_args.kwargs["queue"], "long")
+		self.assertEqual(enq.call_args.kwargs["timeout"], 500 * norm.SECONDS_PER_FILE)
+		self.assertEqual(out["queued"], 500)
