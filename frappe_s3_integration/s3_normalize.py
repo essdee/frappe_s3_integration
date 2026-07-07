@@ -348,3 +348,52 @@ def _cleanup_local(dry_run=0):
 		f"[s3 local-cleanup] {'DRY-RUN ' if dry_run else ''}done: scanned={len(files)} "
 		f"removed={removed} kept(size-mismatch)={kept} no_local={no_local} errors={errors}"
 	)
+
+
+def diagnose_local(sample=8):
+	"""READ-ONLY diagnostic: why aren't local copies being removed? Reports the File-doc +
+	S3 state for a sample of on-disk files. Run:
+	  bench --site <site> execute frappe_s3_integration.s3_normalize.diagnose_local
+	"""
+	from frappe_s3_integration.s3_core import getS3Connection
+
+	try:
+		conn = getS3Connection()
+	except Exception:
+		conn = None
+
+	total = frappe.db.count("File")
+	s3_yes = frappe.db.count("File", [["custom_is_s3_uploaded", "=", 1]])
+	print(f"[diagnose] File docs: total={total}  custom_is_s3_uploaded=1:{s3_yes}  not-on-s3:{total - s3_yes}")
+
+	for is_private in (1, 0):
+		base = get_files_path(is_private=is_private)
+		try:
+			names = [n for n in os.listdir(base) if os.path.isfile(os.path.join(base, n))]
+		except Exception:
+			names = []
+		print(f"\n[diagnose] {'private' if is_private else 'public'}/files: {len(names)} files on disk (sampling {min(sample, len(names))})")
+		for n in names[:sample]:
+			# Which File doc owns this on-disk file? Try file_name, then key-ends-with, then url-ends-with.
+			rows = frappe.get_all("File", filters={"file_name": n},
+				fields=["name", "file_name", "is_private", "custom_is_s3_uploaded", "custom_s3_key", "custom_s3_bucket_name"], limit=1)
+			if not rows:
+				rows = frappe.get_all("File", filters=[["custom_s3_key", "like", "%" + n]],
+					fields=["name", "file_name", "is_private", "custom_is_s3_uploaded", "custom_s3_key", "custom_s3_bucket_name"], limit=1)
+			if not rows:
+				rows = frappe.get_all("File", filters=[["file_url", "like", "%" + n]],
+					fields=["name", "file_name", "is_private", "custom_is_s3_uploaded", "custom_s3_key", "custom_s3_bucket_name"], limit=1)
+			if not rows:
+				print(f"  {n}: NO File doc -> orphan on disk (safe to ignore)")
+				continue
+			f = rows[0]
+			on_s3 = "n/a"
+			if conn and f.custom_is_s3_uploaded and f.custom_s3_key:
+				try:
+					on_s3 = conn.verify_object(f.custom_s3_bucket_name, f.custom_s3_key,
+						expected_size=os.path.getsize(os.path.join(base, n)))
+				except Exception as e:
+					on_s3 = f"ERR({type(e).__name__})"
+			matches = os.path.basename(_local_path(f.file_name, f.is_private)) == n
+			print(f"  {n}: s3_uploaded={f.custom_is_s3_uploaded} verified_on_s3={on_s3} "
+			      f"my_lookup_matches={matches} key={f.custom_s3_key}")
