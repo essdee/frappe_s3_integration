@@ -397,3 +397,63 @@ def diagnose_local(sample=8):
 			matches = os.path.basename(_local_path(f.file_name, f.is_private)) == n
 			print(f"  {n}: s3_uploaded={f.custom_is_s3_uploaded} verified_on_s3={on_s3} "
 			      f"my_lookup_matches={matches} key={f.custom_s3_key}")
+
+
+# ---------------------------------------------------------------------------------------
+# Orphan report — on-disk files that NO File doc references (unreachable by the app).
+# These are what's left after migration (migrated files' local copies were already
+# removed). READ-ONLY: counts + total size so you can decide how to reclaim the space.
+#   bench --site <site> execute frappe_s3_integration.s3_normalize.orphan_report
+# ---------------------------------------------------------------------------------------
+
+def _referenced_basenames():
+	"""Every on-disk basename that SOME File doc could legitimately own — anything not in
+	this set is an orphan (no File doc points at it)."""
+	refs = set()
+	for f in frappe.get_all("File", filters={"is_folder": 0},
+			fields=["file_name", "file_url", "custom_s3_key"]):
+		if f.file_name:
+			refs.add(re.sub(r"[/\\%?#]", "_", f.file_name))
+		for v in (f.file_url, f.custom_s3_key):
+			if v:
+				base = v.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
+				if base:
+					refs.add(base)
+	return refs
+
+
+def _iter_orphans(refs):
+	"""Yield (abs_path, is_private, size) for every on-disk file with no owning File doc."""
+	for is_private in (1, 0):
+		base = get_files_path(is_private=is_private)
+		try:
+			names = os.listdir(base)
+		except Exception:
+			continue
+		for n in names:
+			if n in refs:
+				continue
+			p = os.path.join(base, n)
+			if not os.path.isfile(p):
+				continue
+			try:
+				yield p, is_private, os.path.getsize(p)
+			except Exception:
+				continue
+
+
+def orphan_report():
+	"""READ-ONLY: count + total size of orphan files (on disk, no File doc references them)."""
+	refs = _referenced_basenames()
+	priv_n = priv_b = pub_n = pub_b = 0
+	for _p, is_private, sz in _iter_orphans(refs):
+		if is_private:
+			priv_n += 1; priv_b += sz
+		else:
+			pub_n += 1; pub_b += sz
+	gb = lambda b: b / (1024 ** 3)
+	print(f"[orphans] private/files: {priv_n} orphan file(s), {gb(priv_b):.2f} GB")
+	print(f"[orphans] public/files : {pub_n} orphan file(s), {gb(pub_b):.2f} GB")
+	print(f"[orphans] TOTAL: {priv_n + pub_n} orphan file(s), {gb(priv_b + pub_b):.2f} GB reclaimable")
+	print("[orphans] (orphan = on disk but NO File doc references it — unreachable by the app)")
+	return {"private": priv_n, "public": pub_n, "bytes": priv_b + pub_b}
