@@ -908,6 +908,7 @@ def diagnose_attach_backfill_all(examples=6):
 	)
 	counts = Counter()
 	samples = defaultdict(list)
+	field_targets = Counter()   # (doctype, field) tally for the field_not_on_doctype bucket
 	for f in rows:
 		dt, dn, fld = f.attached_to_doctype, f.attached_to_name, f.attached_to_field
 		expected = _expected_local_url(f.custom_s3_key)
@@ -922,6 +923,7 @@ def diagnose_attach_backfill_all(examples=6):
 				single = meta.issingle
 				if not meta.has_field(fld):
 					reason = "field_not_on_doctype"
+					field_targets[(dt, fld)] += 1
 				elif not single and not (dn and frappe.db.exists(dt, dn)):
 					reason = "parent_record_missing"
 				else:
@@ -940,17 +942,21 @@ def diagnose_attach_backfill_all(examples=6):
 				reason = "error_" + type(e).__name__
 		counts[reason] += 1
 		if len(samples[reason]) < examples:
-			samples[reason].append((f.name, f.custom_s3_key, expected, cur))
+			samples[reason].append((f.name, dt, dn, fld, f.custom_s3_key, cur))
 
 	total = sum(counts.values())
 	print(f"[attach-backfill diagnose] scanned {total} file(s) — reason breakdown:\n")
 	for reason, c in counts.most_common():
 		print(f"  {c:>9}  {reason}")
+	if field_targets:
+		print("\n--- field_not_on_doctype: top (doctype, field) targets ---")
+		for (dt, fld), c in field_targets.most_common(20):
+			print(f"  {c:>9}  {dt} . {fld}")
 	print("\n--- example values per reason ---")
 	for reason, _c in counts.most_common():
 		print(f"\n[{reason}]")
-		for name, key, exp, cur in samples[reason]:
-			print(f"  {name}: key={key!r} expected={exp!r} current={cur!r}")
+		for name, dt, dn, fld, key, cur in samples[reason]:
+			print(f"  {name}: {dt}/{dn}.{fld}  key={key!r} current={cur!r}")
 	return dict(counts)
 
 
