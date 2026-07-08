@@ -16,9 +16,24 @@ from frappe_s3_integration.s3_core import getS3Connection
 
 
 def _backup_dir(settings):
-	path = (settings.get("backup_directory") or "").strip() or get_site_path("private", "backups", "s3")
+	"""Where the bucket archives are written. Defaults OUTSIDE Frappe's own
+	private/backups/ — Frappe's native backup cleanup (delete_temp_backups) os.remove()s
+	every ENTRY in private/backups and raises IsADirectoryError on a subdirectory, which
+	broke the site's scheduled S3 backup. `backup_directory` may point anywhere the server
+	can write, including a mounted remote path to keep the second copy off this machine."""
+	path = (settings.get("backup_directory") or "").strip() or get_site_path("private", "s3_bucket_backups")
 	os.makedirs(path, exist_ok=True)
 	return path
+
+
+def _is_mounted(path):
+	"""True if `path` (or its nearest existing ancestor) sits on a MOUNTED filesystem.
+	Used to refuse writing when a remote backup target isn't actually mounted, so archives
+	never silently fall back onto this server's local disk."""
+	p = os.path.abspath(path)
+	while not os.path.exists(p) and p != os.path.dirname(p):
+		p = os.path.dirname(p)
+	return os.path.ismount(p)
 
 
 def _safe_rel_key(key):
@@ -65,6 +80,15 @@ def run_backup_s3_buckets():
 	conn = getS3Connection()
 	settings = conn.s3_settings
 	if settings.disable_s3_operations or not settings.get("enable_bucket_backup"):
+		return
+	# Keep this server's disk minimal: when the archives go to another machine, refuse to
+	# run if that target isn't actually mounted — otherwise writes would silently land on
+	# local disk. Opt-in via site_config: {"s3_backup_require_mount": 1}.
+	configured = (settings.get("backup_directory") or "").strip()
+	if configured and frappe.conf.get("s3_backup_require_mount") and not _is_mounted(configured):
+		frappe.log_error(
+			f"S3 Backup: target {configured} is not a mounted filesystem — skipping this run "
+			f"so archives never fall back to local disk.", "S3 Backup")
 		return
 	keep = int(settings.get("backup_retention_count") or 7)
 	base = _backup_dir(settings)

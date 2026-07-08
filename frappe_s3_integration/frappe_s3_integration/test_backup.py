@@ -28,6 +28,28 @@ class TestBackup(FrappeTestCase):
 		removed = backup._prune_old_archives(d, "pub-", keep=0)
 		self.assertEqual(len(removed), 3)
 
+	def test_default_backup_dir_is_outside_frappe_backups(self):
+		# Regression: bucket archives must NOT land in Frappe's own private/backups/ — its
+		# native backup cleanup (delete_temp_backups) os.remove()s every entry there and
+		# crashes (IsADirectoryError) on a subdirectory, which broke the scheduled S3 backup.
+		from frappe.utils import get_backups_path
+		settings = MagicMock()
+		settings.get.side_effect = lambda *a, **k: ""   # no backup_directory override -> default
+		with patch.object(backup.os, "makedirs"):
+			d = backup._backup_dir(settings)
+		frappe_backups = os.path.abspath(get_backups_path())
+		self.assertFalse(os.path.abspath(d).startswith(frappe_backups + os.sep),
+		                 f"bucket backups must not live inside {frappe_backups}")
+
+	def test_backup_directory_setting_is_honored(self):
+		# a configured backup_directory (e.g. a mounted remote path) is used verbatim.
+		settings = MagicMock()
+		settings.get.side_effect = lambda k, *a: "/mnt/backup-box/essdee" if k == "backup_directory" else ""
+		with patch.object(backup.os, "makedirs") as mk:
+			d = backup._backup_dir(settings)
+		self.assertEqual(d, "/mnt/backup-box/essdee")
+		mk.assert_called_once_with("/mnt/backup-box/essdee", exist_ok=True)
+
 	def test_safe_rel_key(self):
 		self.assertEqual(backup._safe_rel_key("uploads/a.png"), "uploads/a.png")
 		self.assertIsNone(backup._safe_rel_key("../../etc/passwd"))
@@ -88,6 +110,46 @@ class TestBackup(FrappeTestCase):
 		# no new archives written, none pruned -> still exactly the 4 originals
 		archives = sorted(f for f in os.listdir(d) if f.endswith(".tar.gz"))
 		self.assertEqual(len(archives), 4)
+
+	def test_backup_aborts_when_mount_required_but_target_not_mounted(self):
+		# no-local-space guarantee: a down mount must skip the run, never write locally.
+		conn = self._conn("/mnt/backup-box/erp")
+		with patch.object(backup.frappe, "conf", {"s3_backup_require_mount": 1}), \
+		     patch.object(backup.frappe, "log_error"), \
+		     patch.object(backup, "_is_mounted", return_value=False), \
+		     patch.object(backup, "getS3Connection", return_value=conn):
+			backup.run_backup_s3_buckets()
+		conn.list_objects.assert_not_called()  # never even started -> zero local writes
+
+	def test_backup_runs_when_mount_required_and_target_mounted(self):
+		d = tempfile.mkdtemp()
+		conn = self._conn(d)
+		conn.download_object.side_effect = lambda b, k, dest: open(dest, "w").write("abc")
+		with patch.object(backup.frappe, "conf", {"s3_backup_require_mount": 1}), \
+		     patch.object(backup, "_is_mounted", return_value=True), \
+		     patch.object(backup, "getS3Connection", return_value=conn):
+			backup.run_backup_s3_buckets()
+		self.assertEqual(len([f for f in os.listdir(d) if f.endswith(".tar.gz")]), 2)
+
+	def test_mount_check_skipped_when_flag_off(self):
+		# without the opt-in flag, an unmounted/plain dir still backs up (default behaviour).
+		d = tempfile.mkdtemp()
+		conn = self._conn(d)
+		conn.download_object.side_effect = lambda b, k, dest: open(dest, "w").write("abc")
+		with patch.object(backup.frappe, "conf", {}), \
+		     patch.object(backup, "_is_mounted", return_value=False) as im, \
+		     patch.object(backup, "getS3Connection", return_value=conn):
+			backup.run_backup_s3_buckets()
+		im.assert_not_called()  # guard not consulted when the flag is off
+		self.assertEqual(len([f for f in os.listdir(d) if f.endswith(".tar.gz")]), 2)
+
+	def test_is_mounted_walks_to_existing_ancestor(self):
+		with patch.object(backup.os.path, "exists", side_effect=lambda p: p == "/mnt/box"), \
+		     patch.object(backup.os.path, "ismount", side_effect=lambda p: p == "/mnt/box"):
+			self.assertTrue(backup._is_mounted("/mnt/box/erp/2026"))   # ancestor is the mount
+		with patch.object(backup.os.path, "exists", side_effect=lambda p: p == "/mnt/box"), \
+		     patch.object(backup.os.path, "ismount", return_value=False):
+			self.assertFalse(backup._is_mounted("/mnt/box/erp/2026"))  # nothing mounted
 
 	def test_backup_skipped_when_disabled(self):
 		conn = MagicMock()
