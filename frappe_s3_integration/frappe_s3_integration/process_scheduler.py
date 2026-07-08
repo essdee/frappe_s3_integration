@@ -6,7 +6,9 @@ from frappe.utils import get_site_path
 from rq.timeouts import JobTimeoutException
 from werkzeug.datastructures import FileStorage
 
-from frappe_s3_integration.s3_core import getS3Connection, get_proxy_url, _guess_content_type, _s3_key_from_file_url
+from frappe_s3_integration.s3_core import (
+	getS3Connection, get_proxy_url, _guess_content_type, _s3_key_from_file_url, child_attach_repoint,
+)
 
 
 def _hash_local_file(path):
@@ -85,7 +87,14 @@ def _repoint_attached(file):
 		return
 	try:
 		meta = frappe.get_meta(file.attached_to_doctype)
+		proxy = get_proxy_url(file.name, file.file_name)
 		if not meta.has_field(file.attached_to_field):
+			# Not a parent field — may be a CHILD-table Attach field (e.g. Essdee Bulk Payment
+			# .advance_image lives on child 'Essdee Bulk Payment Entry'). file.file_url is still
+			# this file's local url here, so it's the identity to match child rows against.
+			if child_attach_repoint(file.attached_to_doctype, file.attached_to_name,
+			                        file.attached_to_field, file.file_url, proxy):
+				frappe.db.commit()
 			return
 		single = meta.issingle
 		if single:
@@ -97,7 +106,6 @@ def _repoint_attached(file):
 			return
 		if current != file.file_url:
 			return  # field moved on (external / cleared / newer file) — never clobber it
-		proxy = get_proxy_url(file.name, file.file_name)
 		if single:
 			frappe.db.set_single_value(file.attached_to_doctype, file.attached_to_field,
 			                           proxy, update_modified=False)

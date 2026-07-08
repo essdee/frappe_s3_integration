@@ -531,6 +531,42 @@ def get_proxy_url(file_id, file_name=None):
 	return f"/api/method/frappe_s3_integration.s3_core.serve_file?file_id={file_id}"
 
 
+def child_attach_repoint(parent_doctype, parent_name, field, expected_url, proxy_url, dry_run=False):
+	"""Repoint a CHILD-table Attach field to the S3 proxy url.
+
+	When a file is attached to an Attach field that lives on a CHILD doctype (e.g.
+	`Essdee Bulk Payment.advance_image` — the field is on child doctype
+	`Essdee Bulk Payment Entry`), Frappe records attached_to_doctype/name = the PARENT and
+	attached_to_field = the child fieldname, so meta.has_field(parent, field) is False and a
+	plain parent repoint can't reach it. Here we update every child ROW of this parent whose
+	`field` STILL equals `expected_url` (this file's own pre-migration local url) to
+	`proxy_url`. Identity-guarded by that filter — a row pointing at a DIFFERENT file (a
+	different url) is never touched. Returns the number of rows repointed (or that WOULD be,
+	when dry_run). Best-effort: never raises."""
+	if not (parent_doctype and parent_name and field and expected_url):
+		return 0
+	n = 0
+	try:
+		child_doctypes = set()
+		for tf in frappe.get_meta(parent_doctype).get_table_fields():
+			try:
+				if frappe.get_meta(tf.options).has_field(field):
+					child_doctypes.add(tf.options)
+			except Exception:
+				continue
+		for cdt in child_doctypes:
+			rows = frappe.get_all(cdt, filters={
+				"parenttype": parent_doctype, "parent": parent_name, field: expected_url,
+			}, pluck="name")
+			for r in rows:
+				if not dry_run:
+					frappe.db.set_value(cdt, r, field, proxy_url, update_modified=False)
+				n += 1
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), f"S3 child attach repoint failed ({parent_doctype}.{field})")
+	return n
+
+
 def _s3_https_url(bucket, key, region):
 	"""Path-style S3 URL: https://s3.<region>.amazonaws.com/<bucket>/<key>.
 	Path-style (bucket in the PATH, not the hostname) is REQUIRED for buckets whose name

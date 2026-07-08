@@ -512,6 +512,67 @@ class TestS3Normalize(FrappeTestCase):
 		enq.assert_not_called()
 		self.assertEqual(out["queued"], 0)
 
+	# ---- child-table Attach fields (Essdee Bulk Payment.advance_image) ------------------
+	def _child_repoint(self, has_child_field=True, rows=("R1", "R2"), dry_run=False):
+		from frappe_s3_integration import s3_core
+		CORE = "frappe_s3_integration.s3_core"
+		parent_meta = MagicMock()
+		tf = MagicMock(); tf.options = "Essdee Bulk Payment Entry"
+		parent_meta.get_table_fields.return_value = [tf]
+		child_meta = MagicMock(); child_meta.has_field.return_value = has_child_field
+
+		def get_meta(dt):
+			return parent_meta if dt == "Essdee Bulk Payment" else child_meta
+		with patch(f"{CORE}.frappe.get_meta", side_effect=get_meta), \
+		     patch(f"{CORE}.frappe.get_all", return_value=list(rows)) as ga, \
+		     patch(f"{CORE}.frappe.db.set_value") as sv, \
+		     patch(f"{CORE}.frappe.log_error"):
+			n = s3_core.child_attach_repoint("Essdee Bulk Payment", "BLK-1", "advance_image",
+			                                 "/private/files/x.jpg", "PROXY", dry_run=dry_run)
+		return n, ga, sv
+
+	def test_child_repoint_updates_matching_rows(self):
+		n, ga, sv = self._child_repoint()
+		self.assertEqual(n, 2)
+		# identity-scoped query: this parent + the field == this file's own local url
+		filters = ga.call_args.kwargs["filters"]
+		self.assertEqual(filters["parent"], "BLK-1")
+		self.assertEqual(filters["parenttype"], "Essdee Bulk Payment")
+		self.assertEqual(filters["advance_image"], "/private/files/x.jpg")
+		sv.assert_any_call("Essdee Bulk Payment Entry", "R1", "advance_image", "PROXY", update_modified=False)
+		self.assertEqual(sv.call_count, 2)
+
+	def test_child_repoint_dry_run_counts_but_writes_nothing(self):
+		n, ga, sv = self._child_repoint(dry_run=True)
+		self.assertEqual(n, 2)
+		sv.assert_not_called()
+
+	def test_child_repoint_zero_when_field_not_on_child(self):
+		n, ga, sv = self._child_repoint(has_child_field=False)
+		self.assertEqual(n, 0)
+		ga.assert_not_called()   # no child doctype has the field -> no query
+		sv.assert_not_called()
+
+	def test_backfill_routes_child_field_to_child_repoint(self):
+		# a File whose attached_to_field is a CHILD field -> backfill delegates to child_attach_repoint.
+		f = _file(name="F1", custom_s3_key="private/files/x.jpg",
+		          attached_to_doctype="Essdee Bulk Payment", attached_to_name="BLK-1",
+		          attached_to_field="advance_image")
+		meta = MagicMock(issingle=False)
+		meta.has_field.return_value = False   # not a PARENT field
+		with patch(f"{PMOD}.frappe.db.get_table_columns", return_value=["custom_s3_key"]), \
+		     patch(f"{PMOD}.frappe.get_all", return_value=[f]), \
+		     patch(f"{PMOD}.frappe.get_meta", return_value=meta), \
+		     patch(f"{PMOD}.frappe.db.exists", return_value=True), \
+		     patch("frappe_s3_integration.s3_core.get_proxy_url", side_effect=lambda n, fn=None: f"PROXY:{n}"), \
+		     patch("frappe_s3_integration.s3_core.child_attach_repoint", return_value=3) as car, \
+		     patch(f"{PMOD}.frappe.db.commit"), \
+		     patch(f"{PMOD}.frappe.clear_cache"), \
+		     patch(f"{PMOD}.frappe.log_error"):
+			norm._backfill_attached_fields()
+		car.assert_called_once_with("Essdee Bulk Payment", "BLK-1", "advance_image",
+		                            "/private/files/x.jpg", "PROXY:F1", dry_run=False)
+
 	# ---- content_hash backfill (invariant 4) --------------------------------------------
 	def _run_hash_backfill(self, files, conn, local_exists=False, local_bytes=b"LOCAL",
 	                       disabled=0, dry_run=0):

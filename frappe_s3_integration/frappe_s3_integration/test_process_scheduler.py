@@ -235,6 +235,22 @@ class TestInvariant2Repoint(FrappeTestCase):
 		ssv.assert_not_called()
 		commit.assert_not_called()
 
+	def test_child_table_field_routes_to_child_repoint(self):
+		# attached_to_field is a CHILD field (not on the parent) -> repoint child rows.
+		f = _file(attached_to_doctype="Essdee Bulk Payment", attached_to_name="BLK-1",
+		          attached_to_field="advance_image", file_url="/private/files/x.jpg")
+		meta = MagicMock()
+		meta.has_field.return_value = False  # not a parent field
+		with patch(f"{PKG}.frappe.get_meta", return_value=meta), \
+		     patch(f"{PKG}.get_proxy_url", return_value="PROXY"), \
+		     patch(f"{PKG}.child_attach_repoint", return_value=2) as car, \
+		     patch(f"{PKG}.frappe.db") as db, \
+		     patch(f"{PKG}.frappe.log_error"):
+			ps._repoint_attached(f)
+		car.assert_called_once_with("Essdee Bulk Payment", "BLK-1", "advance_image",
+		                            "/private/files/x.jpg", "PROXY")
+		db.commit.assert_called_once()   # committed since a child row was repointed
+
 	def test_single_skips_when_logo_replaced(self):
 		# app_logo was replaced by a newer logo file -> the older File must not restore the old one.
 		f = _file(attached_to_doctype="Website Settings", attached_to_name="Website Settings",

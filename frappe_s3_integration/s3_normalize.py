@@ -451,7 +451,7 @@ def _backfill_attached_fields(dry_run=0):
 	if "custom_s3_key" not in frappe.db.get_table_columns("File"):
 		return
 
-	from frappe_s3_integration.s3_core import get_proxy_url
+	from frappe_s3_integration.s3_core import get_proxy_url, child_attach_repoint
 
 	try:
 		from rq.timeouts import JobTimeoutException
@@ -473,24 +473,39 @@ def _backfill_attached_fields(dry_run=0):
 			if not (dt and fld):
 				skipped += 1
 				continue
+			if not frappe.db.exists("DocType", dt):
+				skipped += 1  # attached-to doctype removed
+				continue
+			# IDENTITY guard for every branch: only ever touch a value STILL holding THIS
+			# file's OWN pre-migration local url (== '/' + its Frappe-layout key) — never an
+			# already-proxied value, an external URL, a cleared field, or a newer sibling File.
+			expected = _expected_local_url(f.custom_s3_key)
+			if not expected:
+				skipped += 1
+				continue
+			proxy = get_proxy_url(f.name, f.file_name)
 			meta = frappe.get_meta(dt)
 			if not meta.has_field(fld):
-				skipped += 1
+				# Not a parent field — it may live on a CHILD table (e.g. Essdee Bulk Payment
+				# .advance_image on child 'Essdee Bulk Payment Entry'). Repoint matching child rows.
+				if not (dn and frappe.db.exists(dt, dn)):
+					skipped += 1
+					continue
+				n = child_attach_repoint(dt, dn, fld, expected, proxy, dry_run=dry_run)
+				if n:
+					if not dry_run:
+						frappe.db.commit()
+					repointed += n
+				else:
+					skipped += 1  # removed field, or no child row still on the old url
 				continue
 			if not meta.issingle and not (dn and frappe.db.exists(dt, dn)):
 				skipped += 1
 				continue
 			current = _current_attach_value(dt, dn, fld, meta.issingle)
-			# IDENTITY guard: only fix a field that STILL holds THIS file's OWN pre-migration
-			# local url (== '/' + its Frappe-layout key). This skips an already-proxied value,
-			# an external URL, a cleared field — AND a newer sibling File on the same field, so
-			# we never repoint a record to an older attachment (Frappe leaves the old File's
-			# attached_to_field set when an Attach field is replaced).
-			expected = _expected_local_url(f.custom_s3_key)
-			if not expected or current != expected:
+			if current != expected:
 				skipped += 1
 				continue
-			proxy = get_proxy_url(f.name, f.file_name)
 			if dry_run:
 				frappe.logger("s3").info(
 					f"[attach-backfill dry-run] would repoint {dt}/{dn}.{fld}: {current} -> proxy (File {f.name})")
@@ -891,6 +906,13 @@ def diagnose_attach_backfill(sample=12):
 	return {"sampled": len(rows)}
 
 
+def _child_meta_has(child_doctype, field):
+	try:
+		return frappe.get_meta(child_doctype).has_field(field)
+	except Exception:
+		return False
+
+
 def diagnose_attach_backfill_all(examples=6):
 	"""READ-ONLY: scan EVERY file attach-backfill considers and tally WHY each is skipped —
 	the FULL breakdown (not a sample), plus a few real example values per reason. Cheap
@@ -922,7 +944,8 @@ def diagnose_attach_backfill_all(examples=6):
 				meta = frappe.get_meta(dt)
 				single = meta.issingle
 				if not meta.has_field(fld):
-					reason = "field_not_on_doctype"
+					is_child = any(_child_meta_has(tf.options, fld) for tf in meta.get_table_fields())
+					reason = "child_field_fixable" if is_child else "removed_field_nothing_to_do"
 					field_targets[(dt, fld)] += 1
 				elif not single and not (dn and frappe.db.exists(dt, dn)):
 					reason = "parent_record_missing"
