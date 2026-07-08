@@ -64,10 +64,12 @@ class TestS3Engine(FrappeTestCase):
 		self.assertEqual(res["key"], "files/my file.pdf")             # flat, Frappe layout, real name
 		self.assertIn("files/my%20file.pdf", res["file_url"])         # percent-encoded url
 
-	def test_upload_uses_explicit_frappe_key_verbatim(self):
-		# The migration sweep passes the file's Frappe path as the key -> used as-is, no uuid.
+	def test_upload_uses_explicit_frappe_key_when_free(self):
+		# The migration sweep passes the file's Frappe path as the key -> used unchanged when
+		# the object is free (collision-guarded, but no suffix without a real collision).
 		c = self._conn()
 		c.connection.meta.region_name = "ap-south-1"
+		c.verify_object = MagicMock(return_value=False)   # no collision
 		file = MagicMock(filename="x.pdf", content_type="application/pdf")
 		file.stream = io.BytesIO(b"12345")
 		res = c.upload_file_to_bucket(file, bucket_name="b", allow_public=False, key="private/files/x.pdf")

@@ -354,6 +354,164 @@ class TestS3Normalize(FrappeTestCase):
 		enq.assert_not_called()
 		self.assertEqual(out["queued"], 0)
 
+	# ---- sibling sync (same file uploaded -> all File docs point to S3) ------------------
+	def _run_sibling_sync(self, files, twin, verify=True, disabled=0, dry_run=0, local_here=False):
+		conn = MagicMock()
+		conn.verify_object.return_value = verify
+		with patch(f"{PMOD}.frappe.db.get_table_columns", return_value=["custom_s3_key"]), \
+		     patch(f"{PMOD}.frappe.db.get_single_value", return_value=disabled), \
+		     patch("frappe_s3_integration.s3_core.getS3Connection", return_value=conn), \
+		     patch(f"{PMOD}.frappe.get_all", return_value=files), \
+		     patch(f"{PMOD}._migrated_twin", return_value=twin), \
+		     patch(f"{PMOD}.get_files_path", return_value="/tmp/x"), \
+		     patch(f"{PMOD}.os.path.isfile", return_value=local_here), \
+		     patch(f"{PMOD}.os.path.getsize", return_value=5), \
+		     patch("frappe_s3_integration.s3_core.get_proxy_url", side_effect=lambda n, fn=None: f"PROXY:{n}"), \
+		     patch(f"{PMOD}._repoint_attached_field") as rep, \
+		     patch(f"{PMOD}.frappe.db.set_value") as setv, \
+		     patch(f"{PMOD}.frappe.db.commit"), \
+		     patch(f"{PMOD}.frappe.clear_cache") as cc, \
+		     patch(f"{PMOD}.frappe.log_error"):
+			norm._sync_s3_siblings(dry_run=dry_run)
+		return conn, setv, rep, cc
+
+	def test_sibling_sync_points_straggler_at_twin(self):
+		# the 2nd upload of the same file, stuck on a dead local url, is pointed at the twin's
+		# S3 object + its attach field repointed (identity-guarded on the straggler's own url).
+		f = _file(name="S1", file_url="/private/files/a.png", custom_s3_key="",
+		          attached_to_doctype="Employee", attached_to_name="EMP-2", attached_to_field="image")
+		f.content_hash = "h1"
+		twin = frappe._dict(custom_s3_key="private/files/a.png", custom_s3_bucket_name="bkt")
+		conn, setv, rep, cc = self._run_sibling_sync([f], twin)
+		setv.assert_called_once_with("File", "S1", {
+			"custom_s3_key": "private/files/a.png",
+			"custom_s3_bucket_name": "bkt",
+			"custom_is_s3_uploaded": 1,
+			"file_url": "PROXY:S1",
+		}, update_modified=False)
+		rep.assert_called_once_with(f, "PROXY:S1", expected="/private/files/a.png")
+		cc.assert_called_once()  # refresh caches (a synced Single would otherwise serve stale)
+
+	def test_sibling_sync_hashes_local_bytes_before_matching(self):
+		# a hashless straggler with local bytes: hash from its OWN bytes (stored), then match.
+		import io, hashlib
+		f = _file(name="S1", file_url="/private/files/a.png")
+		f.content_hash = ""
+		twin = frappe._dict(custom_s3_key="private/files/a.png", custom_s3_bucket_name="bkt")
+		conn = MagicMock(); conn.verify_object.return_value = True
+		with patch(f"{PMOD}.frappe.db.get_table_columns", return_value=["custom_s3_key"]), \
+		     patch(f"{PMOD}.frappe.db.get_single_value", return_value=0), \
+		     patch("frappe_s3_integration.s3_core.getS3Connection", return_value=conn), \
+		     patch(f"{PMOD}.frappe.get_all", return_value=[f]), \
+		     patch(f"{PMOD}._migrated_twin", return_value=twin), \
+		     patch(f"{PMOD}.get_files_path", return_value="/tmp/x"), \
+		     patch(f"{PMOD}.os.path.isfile", return_value=True), \
+		     patch(f"{PMOD}.os.path.getsize", return_value=5), \
+		     patch(f"{PMOD}.open", return_value=io.BytesIO(b"BYTES"), create=True), \
+		     patch("frappe_s3_integration.s3_core.get_proxy_url", side_effect=lambda n, fn=None: f"PROXY:{n}"), \
+		     patch(f"{PMOD}._repoint_attached_field"), \
+		     patch(f"{PMOD}.frappe.db.set_value") as setv, \
+		     patch(f"{PMOD}.frappe.db.commit"), \
+		     patch(f"{PMOD}.frappe.clear_cache"), \
+		     patch(f"{PMOD}.frappe.log_error"):
+			norm._sync_s3_siblings()
+		# the computed hash was persisted, and the twin's object was size-verified (5 bytes)
+		setv.assert_any_call("File", "S1", "content_hash", hashlib.md5(b"BYTES").hexdigest(), update_modified=False)
+		self.assertEqual(conn.verify_object.call_args.kwargs.get("expected_size"), 5)
+
+	def test_sibling_sync_skips_when_no_twin(self):
+		# no migrated twin -> this local copy is the only one; leave it for the normal sweep.
+		f = _file(name="S1", file_url="/private/files/a.png")
+		conn, setv, rep, cc = self._run_sibling_sync([f], twin=None)
+		setv.assert_not_called()
+		rep.assert_not_called()
+
+	def test_sibling_sync_skips_when_twin_object_missing(self):
+		# DATA SAFETY: never point a doc at an S3 object that isn't actually there.
+		f = _file(name="S1", file_url="/private/files/a.png")
+		twin = frappe._dict(custom_s3_key="private/files/a.png", custom_s3_bucket_name="bkt")
+		conn, setv, rep, cc = self._run_sibling_sync([f], twin, verify=False)
+		setv.assert_not_called()
+
+	def test_sibling_sync_skips_non_local_url(self):
+		f = _file(name="S1", file_url="https://cdn.example.com/x.png")
+		twin = frappe._dict(custom_s3_key="k", custom_s3_bucket_name="b")
+		conn, setv, rep, cc = self._run_sibling_sync([f], twin)
+		setv.assert_not_called()
+
+	def test_sibling_sync_dry_run_writes_nothing(self):
+		f = _file(name="S1", file_url="/private/files/a.png")
+		twin = frappe._dict(custom_s3_key="private/files/a.png", custom_s3_bucket_name="bkt")
+		conn, setv, rep, cc = self._run_sibling_sync([f], twin, dry_run=1)
+		setv.assert_not_called()
+		rep.assert_not_called()
+		cc.assert_not_called()
+
+	def test_sibling_sync_kill_switch_is_a_noop(self):
+		f = _file(name="S1", file_url="/private/files/a.png")
+		twin = frappe._dict(custom_s3_key="private/files/a.png", custom_s3_bucket_name="bkt")
+		conn, setv, rep, cc = self._run_sibling_sync([f], twin, disabled=1)
+		setv.assert_not_called()
+
+	def test_migrated_twin_matches_by_content_hash(self):
+		f = _file(name="S1", is_private=1, file_url="/private/files/a.png")
+		f.content_hash = "h1"
+		hit = [frappe._dict(custom_s3_key="k", custom_s3_bucket_name="b")]
+		with patch(f"{PMOD}.frappe.get_all", return_value=hit) as ga:
+			twin = norm._migrated_twin(f)
+		self.assertEqual(twin.custom_s3_key, "k")
+		self.assertEqual(ga.call_args.kwargs["filters"]["content_hash"], "h1")
+
+	def test_migrated_twin_never_matches_by_url_without_hash(self):
+		# DATA SAFETY (critical): a shared url is NOT proof of shared content (recycled generic
+		# filenames), so a hashless straggler must return NO twin — never a url-based guess.
+		f = _file(name="S1", file_url="/private/files/a.png")
+		f.content_hash = ""
+		with patch(f"{PMOD}.frappe.get_all") as ga:
+			twin = norm._migrated_twin(f)
+		self.assertIsNone(twin)
+		ga.assert_not_called()  # no query at all — url is never trusted as content identity
+
+	# ---- _repoint_attached_field identity guard -----------------------------------------
+	def _repoint_field(self, current, expected):
+		f = frappe._dict(name="S1", file_name="a.png", attached_to_doctype="Employee",
+		                 attached_to_name="EMP-1", attached_to_field="image")
+		meta = MagicMock(issingle=False)
+		meta.has_field.return_value = True
+		with patch(f"{PMOD}.frappe.get_meta", return_value=meta), \
+		     patch(f"{PMOD}.frappe.db.exists", return_value=True), \
+		     patch(f"{PMOD}.frappe.db.get_value", return_value=current), \
+		     patch(f"{PMOD}.frappe.db.set_value") as sv, \
+		     patch(f"{PMOD}.frappe.log_error"):
+			norm._repoint_attached_field(f, "PROXY", expected=expected)
+		return sv
+
+	def test_repoint_expected_guard_blocks_a_different_file(self):
+		# the field points at a DIFFERENT file's url -> never clobbered (finding 6).
+		sv = self._repoint_field(current="/private/files/OTHER.png", expected="/private/files/a.png")
+		sv.assert_not_called()
+
+	def test_repoint_expected_guard_repoints_own_url(self):
+		sv = self._repoint_field(current="/private/files/a.png", expected="/private/files/a.png")
+		sv.assert_called_once_with("Employee", "EMP-1", "image", "PROXY", update_modified=False)
+
+	def test_enqueue_sibling_sync_queues_long_with_sized_timeout(self):
+		with patch(f"{PMOD}._sibling_sync_count", return_value=300), \
+		     patch(f"{PMOD}.frappe.conf", {}), \
+		     patch(f"{PMOD}.frappe.enqueue") as enq:
+			out = norm.enqueue_sibling_sync()
+		enq.assert_called_once()
+		self.assertEqual(enq.call_args.kwargs["queue"], "long")
+		self.assertEqual(enq.call_args.kwargs["timeout"], 300 * norm.SECONDS_PER_FILE)
+		self.assertEqual(out["queued"], 300)
+
+	def test_enqueue_sibling_sync_noop_when_nothing(self):
+		with patch(f"{PMOD}._sibling_sync_count", return_value=0), \
+		     patch(f"{PMOD}.frappe.enqueue") as enq:
+			out = norm.enqueue_sibling_sync()
+		enq.assert_not_called()
+		self.assertEqual(out["queued"], 0)
+
 	# ---- content_hash backfill (invariant 4) --------------------------------------------
 	def _run_hash_backfill(self, files, conn, local_exists=False, local_bytes=b"LOCAL",
 	                       disabled=0, dry_run=0):
@@ -456,3 +614,58 @@ class TestS3Normalize(FrappeTestCase):
 			out = norm.enqueue_hash_backfill()
 		enq.assert_not_called()
 		self.assertEqual(out["queued"], 0)
+
+	# ---- orphan forensics (read-only) ---------------------------------------------------
+	def test_age_bucket_boundaries(self):
+		self.assertEqual(norm._age_bucket(0.5), "<1d")
+		self.assertEqual(norm._age_bucket(3), "1-7d")
+		self.assertEqual(norm._age_bucket(20), "7-30d")
+		self.assertEqual(norm._age_bucket(400), ">365d")
+
+	def test_orphan_pattern_classification(self):
+		self.assertEqual(norm._orphan_pattern("Invoice Scan.pdf"), "human-named")   # spaces
+		self.assertEqual(norm._orphan_pattern("aabbccddeeff00112233445566.jpeg"), "hash/uuid-named")
+		self.assertEqual(norm._orphan_pattern("attachment_20240101_export.pdf"), "long-auto-named")
+		self.assertEqual(norm._orphan_pattern("x.png"), "short-named")
+
+	def test_orphan_forensics_categorizes_and_is_read_only(self):
+		orphans = [
+			("/p/private/files/aabbccddeeff00112233445566.jpeg", 1, 2048),  # hash-named
+			("/p/private/files/Invoice Scan.pdf", 1, 4096),                 # human-named
+			("/p/public/files/logo_old.png", 0, 512),                      # short-named
+		]
+		with patch(f"{PMOD}._referenced_basenames", return_value=set()), \
+		     patch(f"{PMOD}.frappe.db.count", return_value=100), \
+		     patch(f"{PMOD}._iter_orphans", return_value=iter(orphans)), \
+		     patch(f"{PMOD}.os.path.getmtime", return_value=0.0), \
+		     patch(f"{PMOD}.frappe.get_all", return_value=[]) as ga, \
+		     patch(f"{PMOD}.frappe.db.set_value") as setv, \
+		     patch(f"{PMOD}.os.remove") as rm:
+			out = norm.orphan_forensics(sample=5)
+		# categorization
+		self.assertEqual(out["orphans"], 3)
+		self.assertEqual(out["bytes"], 2048 + 4096 + 512)
+		self.assertEqual(out["private"], 2)
+		self.assertEqual(out["public"], 1)
+		self.assertEqual(out["by_ext"][".jpeg"], 1)
+		self.assertEqual(out["by_pattern"]["hash/uuid-named"], 1)
+		self.assertEqual(out["by_pattern"]["human-named"], 1)
+		self.assertEqual(out["by_pattern"]["short-named"], 1)
+		# strictly read-only
+		setv.assert_not_called()
+		rm.assert_not_called()
+
+	def test_orphan_forensics_flags_surviving_sibling(self):
+		# a surviving File doc sharing the stem -> classified as a re-upload/dedup leftover.
+		orphans = [("/p/private/files/aabbccddeeff00112233445566.jpeg", 1, 2048)]
+		sib = [frappe._dict(name="F9", file_name="aabbccddeeff00112233445566.jpeg",
+		                    attached_to_doctype="Purchase Invoice", attached_to_name="PI-1")]
+		with patch(f"{PMOD}._referenced_basenames", return_value=set()), \
+		     patch(f"{PMOD}.frappe.db.count", return_value=1), \
+		     patch(f"{PMOD}._iter_orphans", return_value=iter(orphans)), \
+		     patch(f"{PMOD}.os.path.getmtime", return_value=0.0), \
+		     patch(f"{PMOD}.frappe.get_all", return_value=sib) as ga:
+			out = norm.orphan_forensics(sample=5)
+		# the sibling lookup was performed (LIKE on the 24-char stem prefix)
+		self.assertTrue(ga.called)
+		self.assertEqual(out["orphans"], 1)

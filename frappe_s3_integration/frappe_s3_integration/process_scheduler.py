@@ -206,7 +206,9 @@ def migrate_file_to_s3(file_name, conn):
 
 	local_path = _local_path(file)
 
-	# Local bytes gone: heal from a migrated sibling sharing the blob (N1) — never lose the pointer.
+	# Local bytes gone: heal from a migrated sibling sharing the blob (N1) — never lose the
+	# pointer. Match ONLY by content_hash (byte-safe); a shared url is NOT proof of shared
+	# content once local copies are deleted (a recycled filename can hold different bytes).
 	if not local_path or not os.path.exists(local_path):
 		sib = _migrated_sibling(file)
 		if sib and conn.verify_object(sib.custom_s3_bucket_name, sib.custom_s3_key):

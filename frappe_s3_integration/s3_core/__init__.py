@@ -267,7 +267,13 @@ class S3Connection:
 			if not key:
 				# No Frappe path supplied (direct API upload): build one the Frappe way.
 				prefix = "files" if allow_public else "private/files"
-				key = self._unique_key(bucket_name, f"{prefix}/{_s3_safe_filename(file.filename)}")
+				key = f"{prefix}/{_s3_safe_filename(file.filename)}"
+			# ALWAYS collision-guard the key — even a caller-supplied one. This app deletes
+			# local copies after migrating, so a recycled generic filename (report.pdf) can
+			# map two DIFFERENT files to the same url-derived key; without this the second
+			# upload would OVERWRITE the first object and the first File doc would then serve
+			# the wrong content. Legitimate dedup never reaches here (it reuses the sibling).
+			key = self._unique_key(bucket_name, key)
 			content_type = getattr(file, "content_type", None) or _guess_content_type(file.filename)
 			extra_args = {"ContentType": content_type}
 			if allow_public:

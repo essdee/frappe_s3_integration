@@ -39,6 +39,7 @@ class TestMigrateSafety(FrappeTestCase):
 		     patch(f"{PKG}._point_doc_at_s3") as point, \
 		     patch(f"{PKG}.frappe.db"), \
 		     patch(f"{PKG}.frappe.get_meta"), \
+		     patch(f"{PKG}.frappe.log_error"), \
 		     patch(f"{PKG}.os.remove") as rm:
 			raised = None
 			try:
@@ -107,6 +108,17 @@ class TestMigrateSafety(FrappeTestCase):
 		self.assertIsNone(raised)
 		conn.upload_file_to_private_bucket.assert_not_called()
 		point.assert_called_once_with(f, "ks", "bs")  # actually repointed (not a no-op)
+		rm.assert_not_called()
+
+	def test_local_missing_no_hash_sibling_is_left_for_manual_recovery(self):
+		# Straggler with NO content_hash whose local bytes are gone: we must NOT guess a twin
+		# from a shared url (recycled names can hold different bytes) — leave it + log.
+		conn = MagicMock()
+		f = _file(content_hash="")
+		rm, point, raised = self._run(conn, f, exists=False, migrated_sibling=None)
+		self.assertIsNone(raised)
+		conn.upload_file_to_private_bucket.assert_not_called()
+		point.assert_not_called()  # never repointed onto an unverified-content object
 		rm.assert_not_called()
 
 	def test_idempotent_when_already_keyed(self):

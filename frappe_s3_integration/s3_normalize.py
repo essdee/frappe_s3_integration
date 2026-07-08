@@ -63,13 +63,14 @@ def _local_path(file_name, is_private):
 	return get_files_path(safe, is_private=bool(is_private))
 
 
-def _repoint_attached_field(f, proxy_url):
+def _repoint_attached_field(f, proxy_url, expected=None):
 	"""Best-effort: point the attached doc's Attach field at the new proxy url.
 	Singles-aware — a Single doctype (e.g. Website Settings) stores values in tabSingles,
 	so repoint via set_single_value rather than the deprecated single-through-set_value route.
-	Guarded — only rewrite a field that STILL serves a local /files path, so we never clobber
-	an external URL, a cleared field, or an already-proxied value (the proxy url is invariant
-	under re-keying, so an already-correct field needs no write)."""
+	Guarded — with `expected` given, only rewrite when the field's current value EQUALS it
+	(strong identity: it still points at THIS file's own url, never at a different file). With
+	no `expected`, fall back to the weaker stale-local guard (any /files url), which is enough
+	for re-keying where the proxy url is invariant."""
 	if not (f.attached_to_doctype and f.attached_to_field):
 		return
 	try:
@@ -83,7 +84,10 @@ def _repoint_attached_field(f, proxy_url):
 			current = frappe.db.get_value(f.attached_to_doctype, f.attached_to_name, f.attached_to_field)
 		else:
 			return
-		if not _is_stale_local_url(current):
+		if expected is not None:
+			if current != expected:
+				return  # field points at a DIFFERENT file (or moved on) — never clobber it
+		elif not _is_stale_local_url(current):
 			return
 		if single:
 			frappe.db.set_single_value(f.attached_to_doctype, f.attached_to_field, proxy_url, update_modified=False)
@@ -520,6 +524,178 @@ def _backfill_attached_fields(dry_run=0):
 
 
 # ---------------------------------------------------------------------------------------
+# Sibling sync — the SAME file uploaded more than once makes several File docs share ONE
+# physical blob (Frappe dedups identical content to one file_url + one content_hash). The
+# migration sweep only picks up custom_is_s3_uploaded=1 docs, so a duplicate File doc that
+# is flag=0 (pre-app data) or hashless, whose local copy was already removed by a migrated
+# sibling, is left STUCK pointing at a dead /files/<x> path. This points EVERY such straggler
+# at the S3 object its content-identical twin already holds — so all File docs of the same
+# file end up on S3, none left on a deleted local copy.
+# Run:  bench --site <site> execute frappe_s3_integration.s3_normalize.enqueue_sibling_sync
+#   (dry run: append  --kwargs "{'dry_run': 1}")
+# SAFE: never uploads, never deletes S3 objects or local files. A twin is matched ONLY by
+# content_hash (a hashless straggler is first hashed from its OWN local bytes) — never by a
+# shared url, because a recycled filename can hold different content under the same url. The
+# twin's object is verified present (and size-matched when the local copy survives) before
+# any repoint, and the attach field is only moved when it still holds this file's own url.
+# Idempotent + resumable (per-file commits).
+# ---------------------------------------------------------------------------------------
+
+# Unmigrated File docs still holding a local /files url (any custom_is_s3_uploaded flag —
+# pre-app docs have flag=0, so we must NOT filter on it here).
+SIBLING_SYNC_FILTERS = [
+	["is_folder", "=", 0],
+	["custom_s3_key", "is", "not set"],
+	["file_url", "like", "%files/%"],
+]
+
+
+def _migrated_twin(f):
+	"""A File already on S3 holding the SAME bytes as this straggler — matched ONLY by
+	content_hash (byte-safe: identical md5 => identical content). We deliberately do NOT
+	infer content identity from a shared file_url: this app deletes local copies after
+	migrating, so a recycled generic filename (report.pdf) can point at DIFFERENT bytes under
+	the same url — trusting the url would make a record serve the wrong file. A hashless
+	straggler is hashed from its own local bytes by the caller before this runs."""
+	if not f.content_hash:
+		return None
+	rows = frappe.get_all("File", filters={
+		"content_hash": f.content_hash, "is_private": f.is_private,
+		"name": ["!=", f.name], "custom_s3_key": ["is", "set"],
+		"custom_s3_bucket_name": ["is", "set"],
+	}, fields=["custom_s3_key", "custom_s3_bucket_name"], limit=1)
+	return rows[0] if rows else None
+
+
+def _sibling_sync_count():
+	if "custom_s3_key" not in frappe.db.get_table_columns("File"):
+		return 0
+	return frappe.db.count("File", SIBLING_SYNC_FILTERS)
+
+
+def enqueue_sibling_sync(dry_run=0):
+	"""Console entry point: size a timeout to the straggler count and enqueue the sibling-sync
+	worker on the `long` queue. Returns the plan (also printed)."""
+	dry_run = cint(dry_run)
+	count = _sibling_sync_count()
+	if not count:
+		print("[s3 sibling-sync] nothing to do — 0 unmigrated File docs on a local url")
+		return {"queued": 0}
+	timeout = _timeout_for(count)
+	frappe.enqueue(
+		"frappe_s3_integration.s3_normalize._sync_s3_siblings",
+		queue="long",
+		timeout=timeout,
+		job_name="s3_sibling_sync",
+		dry_run=dry_run,
+	)
+	print(
+		f"[s3 sibling-sync] queued scan of {count} unmigrated File doc(s) on 'long' queue "
+		f"(timeout={timeout}s, dry_run={bool(dry_run)})"
+	)
+	return {"queued": count, "timeout": timeout, "dry_run": bool(dry_run)}
+
+
+def _sync_s3_siblings(dry_run=0):
+	"""Background worker: point every unmigrated straggler that shares a blob with an already
+	on-S3 File onto that same S3 object (+ repoint its attach field). Never uploads/deletes;
+	only redirects to a VERIFIED existing object holding this file's own content. Resumable."""
+	dry_run = cint(dry_run)
+	if "custom_s3_key" not in frappe.db.get_table_columns("File"):
+		return
+
+	from frappe_s3_integration.s3_core import getS3Connection, get_proxy_url
+
+	if frappe.db.get_single_value("AWS S3 Settings", "disable_s3_operations"):
+		frappe.log_error("S3 disabled — sibling sync skipped", "S3 Sibling Sync")
+		return
+	try:
+		conn = getS3Connection()
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "S3 Sibling Sync: connection failed — skipped")
+		return
+
+	try:
+		from rq.timeouts import JobTimeoutException
+	except Exception:  # pragma: no cover
+		class JobTimeoutException(Exception):
+			pass
+
+	files = frappe.get_all(
+		"File",
+		filters=SIBLING_SYNC_FILTERS,
+		fields=["name", "file_name", "is_private", "content_hash", "file_url",
+		        "attached_to_doctype", "attached_to_name", "attached_to_field"],
+	)
+
+	synced = skipped = errors = 0
+	for f in files:
+		try:
+			url = f.file_url or ""
+			if not (url.startswith("/files/") or url.startswith("/private/files/")):
+				skipped += 1
+				continue
+			# Byte-safe identity: if this straggler has no content_hash but its LOCAL bytes
+			# are still on disk, hash THOSE bytes so it can be matched to a twin by content.
+			# We never guess content identity from a shared url.
+			local_abs = _local_path(f.file_name, f.is_private) if f.file_name else None
+			local_here = bool(local_abs and os.path.isfile(local_abs))
+			if not f.content_hash and local_here:
+				with open(local_abs, "rb") as fh:
+					f.content_hash = _md5_of_stream(fh.read)
+				frappe.db.set_value("File", f.name, "content_hash", f.content_hash, update_modified=False)
+				frappe.db.commit()
+			twin = _migrated_twin(f)
+			if not twin:
+				# no content-matched twin (or hashless with no local copy) — never guess.
+				skipped += 1
+				continue
+			# The twin's object must exist; when we still hold the local copy, its SIZE must
+			# match too (defence in depth on top of the md5 identity) — never point at nothing
+			# and never at a different-sized object.
+			expected_size = os.path.getsize(local_abs) if local_here else None
+			if not conn.verify_object(twin.custom_s3_bucket_name, twin.custom_s3_key,
+			                          expected_size=expected_size):
+				skipped += 1
+				frappe.log_error(
+					f"sibling-sync: twin object missing/size-mismatch {twin.custom_s3_bucket_name}/"
+					f"{twin.custom_s3_key} for File {f.name} — left as-is", "S3 Sibling Sync")
+				continue
+			if dry_run:
+				frappe.logger("s3").info(
+					f"[sibling-sync dry-run] would point File {f.name} ({url}) -> {twin.custom_s3_key}")
+				synced += 1
+				continue
+			proxy = get_proxy_url(f.name, f.file_name)
+			frappe.db.set_value("File", f.name, {
+				"custom_s3_key": twin.custom_s3_key,
+				"custom_s3_bucket_name": twin.custom_s3_bucket_name,
+				"custom_is_s3_uploaded": 1,
+				"file_url": proxy,
+			}, update_modified=False)
+			# identity-guarded: only repoint the parent field if it still holds THIS file's
+			# own local url — never clobber a field that has moved to another file.
+			_repoint_attached_field(f, proxy, expected=url)
+			frappe.db.commit()
+			synced += 1
+		except JobTimeoutException:
+			frappe.db.commit()
+			frappe.log_error(
+				f"sibling-sync: job timeout after {synced} synced — re-run to finish", "S3 Sibling Sync")
+			raise
+		except Exception:
+			errors += 1
+			frappe.log_error(frappe.get_traceback(), f"S3 sibling sync failed for File {f.get('name')}")
+
+	if synced and not dry_run:
+		frappe.clear_cache()
+	print(
+		f"[s3 sibling-sync] {'DRY-RUN ' if dry_run else ''}done: candidates={len(files)} "
+		f"synced={synced} skipped={skipped} errors={errors}"
+	)
+
+
+# ---------------------------------------------------------------------------------------
 # content_hash backfill — every S3-backed File must carry a content_hash (invariant 4):
 # dedup (_migrated_sibling) and both shared-blob delete guards depend on it. New migrations
 # backfill it from local bytes, but files migrated BEFORE that fix (local copy now gone)
@@ -775,3 +951,125 @@ def orphan_report():
 	print(f"[orphans] TOTAL: {priv_n + pub_n} orphan file(s), {gb(priv_b + pub_b):.2f} GB reclaimable")
 	print("[orphans] (orphan = on disk but NO File doc references it — unreachable by the app)")
 	return {"private": priv_n, "public": pub_n, "bytes": priv_b + pub_b}
+
+
+# ---------------------------------------------------------------------------------------
+# Orphan forensics — WHICH orphans + WHY they got orphaned. READ-ONLY, mutates nothing.
+#   bench --site <site> execute frappe_s3_integration.s3_normalize.orphan_forensics
+#   (bigger sample: --kwargs "{'sample': 40}")
+# Answers three questions the plain count can't:
+#   • WHICH: breakdown by extension + naming pattern + a labelled sample of real paths.
+#   • STILL GROWING?: an age histogram (file mtime) — recent buckets mean something is
+#     STILL producing orphans (a live bug), all-old means a one-time historical leftover.
+#   • WHY each one: for a sample, look for a surviving File doc that shares the orphan's
+#     name stem — that distinguishes "a re-upload/dedup left the old bytes behind" from
+#     "the File doc was fully deleted (document/attachment removed)" from "never had a doc".
+# ---------------------------------------------------------------------------------------
+
+_AGE_BUCKETS = ((1, "<1d"), (7, "1-7d"), (30, "7-30d"), (90, "30-90d"), (365, "90-365d"))
+
+
+def _age_bucket(age_days):
+	for lim, label in _AGE_BUCKETS:
+		if age_days < lim:
+			return label
+	return ">365d"
+
+
+def _orphan_pattern(name):
+	"""Rough origin hint from the on-disk name."""
+	stem = os.path.splitext(name)[0]
+	if " " in stem:
+		return "human-named"          # spaces -> a user's original upload filename
+	compact = re.sub(r"[^0-9a-zA-Z]", "", stem)
+	if len(compact) >= 24 and re.fullmatch(r"[0-9a-f]+", compact.lower() or "z"):
+		return "hash/uuid-named"      # long hex -> programmatic (scan/OCR/generated)
+	if len(stem) >= 20:
+		return "long-auto-named"
+	return "short-named"
+
+
+def orphan_forensics(sample=20):
+	"""READ-ONLY: categorize orphan files (which + why + still-growing?). Prints a report and
+	returns the aggregates. See module comment above for what each section means."""
+	import time
+
+	sample = cint(sample) or 20
+	now = time.time()
+	refs = _referenced_basenames()
+
+	total_files = frappe.db.count("File", [["is_folder", "=", 0]])
+	print(f"[forensics] File docs (non-folder): {total_files}")
+
+	by_ext, by_pattern, by_age, by_dir = {}, {}, {}, {"private": [0, 0], "public": [0, 0]}
+	samples = {"private": [], "public": []}
+	n = total_bytes = 0
+	for p, is_private, sz in _iter_orphans(refs):
+		n += 1
+		total_bytes += sz
+		name = os.path.basename(p)
+		ext = (os.path.splitext(name)[1] or "<none>").lower()
+		pat = _orphan_pattern(name)
+		try:
+			age_days = (now - os.path.getmtime(p)) / 86400
+		except Exception:
+			age_days = -1
+		bucket = _age_bucket(age_days) if age_days >= 0 else "unknown"
+		by_ext[ext] = by_ext.get(ext, 0) + 1
+		by_pattern[pat] = by_pattern.get(pat, 0) + 1
+		by_age[bucket] = by_age.get(bucket, 0) + 1
+		d = "private" if is_private else "public"
+		by_dir[d][0] += 1; by_dir[d][1] += sz
+		if len(samples[d]) < sample:
+			samples[d].append((name, sz, age_days))
+
+	gb = lambda b: b / (1024 ** 3)
+	print(f"[forensics] ORPHANS: {n} file(s), {gb(total_bytes):.2f} GB "
+	      f"(private {by_dir['private'][0]}/{gb(by_dir['private'][1]):.2f}GB, "
+	      f"public {by_dir['public'][0]}/{gb(by_dir['public'][1]):.2f}GB)")
+
+	def _hist(title, d, key=lambda kv: -kv[1], top=None):
+		print(f"\n[forensics] {title}")
+		items = sorted(d.items(), key=key)
+		if top:
+			items = items[:top]
+		for k, v in items:
+			print(f"    {str(k):>12}  {v:>7}")
+
+	_hist("by extension (top 15):", by_ext, top=15)
+	_hist("by naming pattern:", by_pattern)
+	# age in chronological order, not by count -> a RECENT bucket with a count = still growing
+	order = {lbl: i for i, (_, lbl) in enumerate([(0, "<1d")] + list(_AGE_BUCKETS))}
+	order["unknown"] = 99
+	_hist("by age (file mtime) — recent buckets mean orphans are STILL being produced:",
+	      by_age, key=lambda kv: order.get(kv[0], 50))
+
+	# WHY, per sampled orphan: is there a surviving File doc sharing this name's stem?
+	for d in ("private", "public"):
+		if not samples[d]:
+			continue
+		print(f"\n[forensics] sample {d}/files (why each is orphaned):")
+		for name, sz, age_days in samples[d]:
+			stem = os.path.splitext(name)[0]
+			prefix = stem[:24]
+			sib = frappe.get_all(
+				"File",
+				filters=[["file_name", "like", prefix + "%"], ["is_folder", "=", 0]],
+				fields=["name", "file_name", "attached_to_doctype", "attached_to_name"],
+				limit=1,
+			)
+			if sib:
+				why = (f"sibling File {sib[0].name} exists (file_name={sib[0].file_name!r}, "
+				       f"attached_to={sib[0].attached_to_doctype}/{sib[0].attached_to_name}) "
+				       f"-> re-upload/dedup left these OLD bytes behind")
+			else:
+				why = "no File doc shares this name -> its File doc was deleted, or bytes were never registered as a File"
+			age_s = f"{age_days:.0f}d" if age_days >= 0 else "?"
+			print(f"    {name}  ({sz/1024:.0f} KB, {age_s} old)\n        {why}")
+
+	print("\n[forensics] READ-ONLY — nothing was moved or deleted.")
+	return {
+		"orphans": n, "bytes": total_bytes,
+		"by_ext": by_ext, "by_pattern": by_pattern, "by_age": by_age,
+		"private": by_dir["private"][0], "public": by_dir["public"][0],
+	}
