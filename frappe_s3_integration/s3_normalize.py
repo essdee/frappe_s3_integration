@@ -891,6 +891,69 @@ def diagnose_attach_backfill(sample=12):
 	return {"sampled": len(rows)}
 
 
+def diagnose_attach_backfill_all(examples=6):
+	"""READ-ONLY: scan EVERY file attach-backfill considers and tally WHY each is skipped —
+	the FULL breakdown (not a sample), plus a few real example values per reason. Cheap
+	checks (key layout, attach link) run first with no DB query, so it's fast unless many
+	files reach the parent-value comparison. Run:
+	  bench --site <site> execute frappe_s3_integration.s3_normalize.diagnose_attach_backfill_all
+	"""
+	from collections import Counter, defaultdict
+
+	examples = cint(examples) or 6
+	rows = frappe.get_all(
+		"File", filters=ATTACH_BACKFILL_FILTERS,
+		fields=["name", "custom_s3_key", "file_url",
+		        "attached_to_doctype", "attached_to_name", "attached_to_field"],
+	)
+	counts = Counter()
+	samples = defaultdict(list)
+	for f in rows:
+		dt, dn, fld = f.attached_to_doctype, f.attached_to_name, f.attached_to_field
+		expected = _expected_local_url(f.custom_s3_key)
+		cur = None
+		if not (dt and fld):
+			reason = "no_attach_dt_or_field"
+		elif not expected:
+			reason = "key_not_files_layout"            # key isn't files/ or private/files/
+		else:
+			try:
+				meta = frappe.get_meta(dt)
+				single = meta.issingle
+				if not meta.has_field(fld):
+					reason = "field_not_on_doctype"
+				elif not single and not (dn and frappe.db.exists(dt, dn)):
+					reason = "parent_record_missing"
+				else:
+					cur = _current_attach_value(dt, dn, fld, single)
+					if cur == expected:
+						reason = "WOULD_REPOINT"
+					elif cur in (None, ""):
+						reason = "parent_field_empty"
+					elif isinstance(cur, str) and "serve_file" in cur:
+						reason = "already_proxy"
+					elif isinstance(cur, str) and (cur.startswith("/files/") or cur.startswith("/private/files/")):
+						reason = "local_url_but_mismatch"
+					else:
+						reason = "other_value"
+			except Exception as e:
+				reason = "error_" + type(e).__name__
+		counts[reason] += 1
+		if len(samples[reason]) < examples:
+			samples[reason].append((f.name, f.custom_s3_key, expected, cur))
+
+	total = sum(counts.values())
+	print(f"[attach-backfill diagnose] scanned {total} file(s) — reason breakdown:\n")
+	for reason, c in counts.most_common():
+		print(f"  {c:>9}  {reason}")
+	print("\n--- example values per reason ---")
+	for reason, _c in counts.most_common():
+		print(f"\n[{reason}]")
+		for name, key, exp, cur in samples[reason]:
+			print(f"  {name}: key={key!r} expected={exp!r} current={cur!r}")
+	return dict(counts)
+
+
 def diagnose_local(sample=8):
 	"""READ-ONLY diagnostic: why aren't local copies being removed? Reports the File-doc +
 	S3 state for a sample of on-disk files. Run:
