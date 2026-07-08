@@ -960,6 +960,42 @@ def diagnose_attach_backfill_all(examples=6):
 	return dict(counts)
 
 
+def where_is_field(doctype=None, field=None):
+	"""READ-ONLY: is `field` a DIRECT field on `doctype`, a CHILD-table field (which table +
+	child doctype), or absent (removed/renamed)? Explains attach-backfill's
+	field_not_on_doctype bucket. Run:
+	  bench --site <site> execute frappe_s3_integration.s3_normalize.where_is_field \\
+	    --kwargs "{'doctype':'Sales Invoice','field':'qrcode_image'}"
+	"""
+	if not (doctype and field):
+		print("pass doctype + field, e.g. --kwargs \"{'doctype':'Sales Invoice','field':'qrcode_image'}\"")
+		return
+	if not frappe.db.exists("DocType", doctype):
+		print(f"{doctype}: DOCTYPE DOES NOT EXIST (removed) — nothing to repoint")
+		return
+	meta = frappe.get_meta(doctype)
+	if meta.has_field(field):
+		f = meta.get_field(field)
+		print(f"{doctype}.{field}: DIRECT field (fieldtype={f.fieldtype}) — should repoint")
+		return
+	hits = []
+	for tf in meta.get_table_fields():
+		try:
+			child = frappe.get_meta(tf.options)
+			if child.has_field(field):
+				cf = child.get_field(field)
+				hits.append((tf.fieldname, tf.options, cf.fieldtype))
+		except Exception:
+			continue
+	if hits:
+		for child_tablefield, child_dt, ftype in hits:
+			print(f"{doctype}.{field}: CHILD-table field — in table '{child_tablefield}' "
+			      f"(child doctype '{child_dt}', fieldtype={ftype}) — needs child-row repoint")
+	else:
+		print(f"{doctype}.{field}: NOT FOUND anywhere (removed/renamed field) — no field holds "
+		      f"this url; the File is already on S3, nothing to repoint")
+
+
 def diagnose_local(sample=8):
 	"""READ-ONLY diagnostic: why aren't local copies being removed? Reports the File-doc +
 	S3 state for a sample of on-disk files. Run:
