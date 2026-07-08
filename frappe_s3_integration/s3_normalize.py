@@ -844,6 +844,53 @@ def _backfill_content_hashes(dry_run=0):
 	)
 
 
+def diagnose_attach_backfill(sample=12):
+	"""READ-ONLY: for a sample of the files attach-backfill would touch, print WHY each is
+	skipped — the file's S3 key, the local url we EXPECT the parent field to still hold, and
+	the parent Attach field's ACTUAL current value. Run:
+	  bench --site <site> execute frappe_s3_integration.s3_normalize.diagnose_attach_backfill
+	"""
+	sample = cint(sample) or 12
+	rows = frappe.get_all(
+		"File", filters=ATTACH_BACKFILL_FILTERS,
+		fields=["name", "file_name", "custom_s3_key", "file_url",
+		        "attached_to_doctype", "attached_to_name", "attached_to_field"],
+		limit=sample,
+	)
+	for f in rows:
+		dt, dn, fld = f.attached_to_doctype, f.attached_to_name, f.attached_to_field
+		expected = _expected_local_url(f.custom_s3_key)
+		cur = single = None
+		reason = ""
+		try:
+			if not (dt and fld):
+				reason = "no attached_to doctype/field"
+			else:
+				meta = frappe.get_meta(dt)
+				single = meta.issingle
+				if not meta.has_field(fld):
+					reason = "field not on doctype"
+				elif not single and not (dn and frappe.db.exists(dt, dn)):
+					reason = "parent record missing"
+				else:
+					cur = _current_attach_value(dt, dn, fld, single)
+					if not expected:
+						reason = "key NOT under files/ or private/files/"
+					elif cur != expected:
+						reason = "current != expected (mismatch)"
+					else:
+						reason = "WOULD REPOINT"
+		except Exception as e:
+			reason = f"ERR: {type(e).__name__}: {e}"
+		print(f"[{f.name}] {dt}/{dn}.{fld}  single={single}")
+		print(f"    file_url = {f.file_url!r}")
+		print(f"    key      = {f.custom_s3_key!r}")
+		print(f"    expected = {expected!r}")
+		print(f"    current  = {cur!r}")
+		print(f"    -> {reason}\n")
+	return {"sampled": len(rows)}
+
+
 def diagnose_local(sample=8):
 	"""READ-ONLY diagnostic: why aren't local copies being removed? Reports the File-doc +
 	S3 state for a sample of on-disk files. Run:
