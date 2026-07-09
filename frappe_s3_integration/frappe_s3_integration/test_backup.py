@@ -3,14 +3,26 @@
 
 import io
 import os
+import shutil
+import socket
 import sys
 import tarfile
 import tempfile
+import threading
+import time
+import unittest
 from unittest.mock import MagicMock, patch
 
+import frappe
 from frappe.tests.utils import FrappeTestCase
 
 from frappe_s3_integration.frappe_s3_integration import backup
+
+try:
+	import paramiko
+	HAS_PARAMIKO = True
+except ImportError:  # paramiko is only needed for remote SSH backup
+	HAS_PARAMIKO = False
 
 
 class _FakeRemoteFile(io.BytesIO):
@@ -20,6 +32,190 @@ class _FakeRemoteFile(io.BytesIO):
 
 	def close(self):
 		pass  # keep the buffer readable after the tar stream closes
+
+
+if HAS_PARAMIKO:
+	class _StubSSHServer(paramiko.ServerInterface):
+		"""Password auth (test/pw) only, so we exercise the real password path."""
+		def check_auth_password(self, username, password):
+			return paramiko.AUTH_SUCCESSFUL if (username == "test" and password == "pw") \
+				else paramiko.AUTH_FAILED
+
+		def check_channel_request(self, kind, chanid):
+			return paramiko.OPEN_SUCCEEDED
+
+		def get_allowed_auths(self, username):
+			return "password"
+
+	class _StubSFTPHandle(paramiko.SFTPHandle):
+		def stat(self):
+			try:
+				return paramiko.SFTPAttributes.from_stat(os.fstat(self.readfile.fileno()))
+			except OSError as e:
+				return paramiko.SFTPServer.convert_errno(e.errno)
+
+	class _StubSFTP(paramiko.SFTPServerInterface):
+		"""A minimal SFTP server backed by a temp directory (paramiko demo pattern)."""
+		ROOT = None
+
+		def _real(self, path):
+			return _StubSFTP.ROOT + self.canonicalize(path)
+
+		def list_folder(self, path):
+			out = []
+			try:
+				for f in os.listdir(self._real(path)):
+					a = paramiko.SFTPAttributes.from_stat(os.stat(os.path.join(self._real(path), f)))
+					a.filename = f
+					out.append(a)
+			except OSError as e:
+				return paramiko.SFTPServer.convert_errno(e.errno)
+			return out
+
+		def stat(self, path):
+			try:
+				return paramiko.SFTPAttributes.from_stat(os.stat(self._real(path)))
+			except OSError as e:
+				return paramiko.SFTPServer.convert_errno(e.errno)
+
+		lstat = stat
+
+		def open(self, path, flags, attr):
+			try:
+				fd = os.open(self._real(path), flags | getattr(os, "O_BINARY", 0), 0o666)
+			except OSError as e:
+				return paramiko.SFTPServer.convert_errno(e.errno)
+			if flags & os.O_WRONLY:
+				mode = "ab" if flags & os.O_APPEND else "wb"
+			elif flags & os.O_RDWR:
+				mode = "a+b" if flags & os.O_APPEND else "r+b"
+			else:
+				mode = "rb"
+			try:
+				f = os.fdopen(fd, mode)
+			except OSError as e:
+				return paramiko.SFTPServer.convert_errno(e.errno)
+			h = _StubSFTPHandle(flags)
+			h.filename = self._real(path)
+			h.readfile = h.writefile = f
+			return h
+
+		def remove(self, path):
+			try:
+				os.remove(self._real(path))
+			except OSError as e:
+				return paramiko.SFTPServer.convert_errno(e.errno)
+			return paramiko.SFTP_OK
+
+		def rename(self, oldpath, newpath):
+			try:
+				os.rename(self._real(oldpath), self._real(newpath))
+			except OSError as e:
+				return paramiko.SFTPServer.convert_errno(e.errno)
+			return paramiko.SFTP_OK
+
+
+@unittest.skipUnless(HAS_PARAMIKO, "paramiko not installed")
+class TestBackupSSHIntegration(FrappeTestCase):
+	"""End-to-end: the real backup code streaming to a real (in-process) SFTP server."""
+
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		import logging
+		# paramiko logs the client disconnect ("Connection reset by peer") as an error — silence
+		# it so the test output stays clean; it's expected teardown noise, not a failure.
+		logging.getLogger("paramiko").setLevel(logging.CRITICAL)
+		cls._host_key = paramiko.RSAKey.generate(2048)
+
+	def setUp(self):
+		self.root = tempfile.mkdtemp(prefix="s3bkp_sftp_")
+		_StubSFTP.ROOT = self.root
+		self._lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		self._lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+		self._lsock.bind(("127.0.0.1", 0))
+		self._lsock.listen(1)
+		self._lsock.settimeout(15)
+		self.port = self._lsock.getsockname()[1]
+
+		def _serve():
+			try:
+				conn, _ = self._lsock.accept()
+				t = paramiko.Transport(conn)
+				t.add_server_key(self._host_key)
+				t.set_subsystem_handler("sftp", paramiko.SFTPServer, _StubSFTP)
+				t.start_server(server=_StubSSHServer())
+				while t.is_active():
+					time.sleep(0.05)
+			except Exception:
+				pass
+
+		self._thread = threading.Thread(target=_serve, daemon=True)
+		self._thread.start()
+		time.sleep(0.1)
+		# accept the ephemeral host key for _connect_sftp (real known_hosts stays untouched)
+		frappe.conf["s3_backup_ssh_autoadd"] = 1
+
+	def tearDown(self):
+		frappe.conf.pop("s3_backup_ssh_autoadd", None)
+		try:
+			self._lsock.close()
+		except Exception:
+			pass
+		shutil.rmtree(self.root, ignore_errors=True)
+
+	def _ssh(self):
+		return {"host": "127.0.0.1", "port": self.port, "user": "test",
+		        "password": "pw", "directory": "/"}
+
+	def _s3_conn(self, blobs, private="prvbkt", public=None):
+		conn = MagicMock()
+		conn.private_bucket, conn.public_bucket = private, public
+		conn.list_objects.return_value = [{"Key": k, "Size": len(v)} for k, v in blobs.items()]
+		conn.get_file_from_bucket.side_effect = lambda key, bucket: {"Body": io.BytesIO(blobs[key])}
+		return conn
+
+	def test_connect_stream_verify_and_retention(self):
+		blobs = {"files/logo.png": b"\x89PNG-logo-bytes",
+		         "private/files/statement.pdf": b"%PDF-1.4 hi " * 40,
+		         "files/emptydir/": b""}          # directory marker -> must be skipped
+		conn = self._s3_conn(blobs)
+		client, sftp = backup._connect_sftp(self._ssh())
+		try:
+			self.assertTrue(client.get_transport().is_authenticated())   # real password auth
+
+			ok = backup._stream_bucket_to_remote(conn, "prvbkt", sftp, "/", "2026-07-09_12-00-00")
+			self.assertTrue(ok)                                          # size-verify passed
+			snap = os.path.join(self.root, "prvbkt-2026-07-09_12-00-00.tar.gz")
+			self.assertTrue(os.path.exists(snap))
+			with tarfile.open(snap, "r:gz") as t:                       # a VALID gzip tar landed
+				self.assertEqual(sorted(m.name for m in t.getmembers()),
+				                 ["prvbkt/files/logo.png", "prvbkt/private/files/statement.pdf"])
+				self.assertEqual(t.extractfile("prvbkt/files/logo.png").read(), blobs["files/logo.png"])
+				self.assertEqual(t.extractfile("prvbkt/private/files/statement.pdf").read(),
+				                 blobs["private/files/statement.pdf"])
+
+			backup._stream_bucket_to_remote(conn, "prvbkt", sftp, "/", "2026-07-09_13-00-00")
+			backup._prune_remote(sftp, "/", "prvbkt", keep=1)           # retention keeps newest
+			self.assertEqual(
+				sorted(f for f in os.listdir(self.root) if f.startswith("prvbkt-") and f.endswith(".tar.gz")),
+				["prvbkt-2026-07-09_13-00-00.tar.gz"])
+		finally:
+			sftp.close()
+			client.close()
+
+	def test_full_run_reaps_stale_part_and_writes_snapshot(self):
+		# the whole _run_remote_backup path (connect -> reap -> stream -> prune -> close).
+		open(os.path.join(self.root, "prvbkt-stale.tar.gz.part"), "wb").close()  # leftover from a killed run
+		conn = self._s3_conn({"files/a.txt": b"alpha", "files/b.txt": b"bravo"})
+		backup._run_remote_backup(conn, self._ssh(), keep=2)
+
+		self.assertFalse(os.path.exists(os.path.join(self.root, "prvbkt-stale.tar.gz.part")))  # reaped
+		snaps = [f for f in os.listdir(self.root) if f.startswith("prvbkt-") and f.endswith(".tar.gz")]
+		self.assertEqual(len(snaps), 1)                                # one snapshot written
+		with tarfile.open(os.path.join(self.root, snaps[0]), "r:gz") as t:
+			self.assertEqual(sorted(m.name for m in t.getmembers()),
+			                 ["prvbkt/files/a.txt", "prvbkt/files/b.txt"])
 
 
 class TestBackup(FrappeTestCase):
