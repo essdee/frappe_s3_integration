@@ -148,19 +148,41 @@ def _connect_sftp(ssh):
 	return client, client.open_sftp()
 
 
+class _CountingWriter:
+	"""Wrap the SFTP file object and count the bytes handed to it. Pipelined SFTP can drop a
+	tail write error (e.g. remote disk full on the last blocks) silently on close, so tarfile
+	reports success while the remote file is truncated. Comparing this count with the remote
+	file's actual size afterwards catches that truncation before we enshrine the snapshot."""
+
+	def __init__(self, fileobj):
+		self._f = fileobj
+		self.count = 0
+
+	def write(self, data):
+		self.count += len(data)
+		return self._f.write(data)
+
+	def flush(self):
+		f = getattr(self._f, "flush", None)
+		if f:
+			f()
+
+
 def _stream_bucket_to_remote(conn, bucket_name, sftp, remote_dir, stamp):
 	"""Stream one bucket into `<dir>/<bucket>-<stamp>.tar.gz` on the remote, object by object,
 	with NO local staging. Writes to a .part file and renames on full success; on any failure
 	the partial file is removed and previous snapshots are kept (never erode the second copy).
-	Returns True only when every object made it into the archive."""
+	Returns True only when every object was archived AND the remote file is the exact size we
+	streamed (so a silently-truncated upload can never be renamed to a good snapshot)."""
 	remote_final = posixpath.join(remote_dir, f"{bucket_name}-{stamp}.tar.gz")
 	remote_part = remote_final + ".part"
 	expected = archived = 0
 	ok = False
 	rf = sftp.open(remote_part, "wb")
+	counter = _CountingWriter(rf)
 	try:
 		rf.set_pipelined(True)
-		with tarfile.open(fileobj=rf, mode="w|gz") as tar:
+		with tarfile.open(fileobj=counter, mode="w|gz") as tar:
 			for obj in conn.list_objects(bucket_name):
 				rel = _safe_rel_key(obj["Key"])
 				if not rel:
@@ -177,7 +199,16 @@ def _stream_bucket_to_remote(conn, bucket_name, sftp, remote_dir, stamp):
 						body.close()
 					except Exception:
 						pass
-		ok = expected == archived
+		rf.close()  # flush pending pipelined writes to the server before we trust the size
+		if expected == archived:
+			remote_size = sftp.stat(remote_part).st_size
+			if remote_size == counter.count:
+				ok = True
+			else:
+				frappe.log_error(
+					f"S3 Backup: {bucket_name} snapshot truncated on remote "
+					f"({remote_size} of {counter.count} bytes) — discarded, previous snapshots kept.",
+					"S3 Backup")
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), f"S3 Backup: streaming {bucket_name} to remote failed")
 	finally:
@@ -199,12 +230,27 @@ def _stream_bucket_to_remote(conn, bucket_name, sftp, remote_dir, stamp):
 	try:
 		sftp.remove(remote_part)
 	except Exception:
-		pass
-	if not ok:
+		pass  # dead connection etc. — reaped by the next run's stale-.part sweep
+	if not ok and archived != expected:
 		frappe.log_error(
 			f"S3 Backup incomplete for {bucket_name}: {archived}/{expected} objects — "
 			f"partial snapshot discarded, previous snapshots kept.", "S3 Backup")
 	return False
+
+
+def _reap_stale_parts(sftp, remote_dir):
+	"""Remove leftover *.tar.gz.part from earlier failed/killed runs. The backup job is
+	deduplicated (never concurrent), so any .part present at the start of a run is stale —
+	otherwise a broken link would leak partial archives onto the remote disk unbounded."""
+	try:
+		stale = [n for n in sftp.listdir(remote_dir) if n.endswith(".tar.gz.part")]
+	except Exception:
+		return
+	for n in stale:
+		try:
+			sftp.remove(posixpath.join(remote_dir, n))
+		except Exception:
+			pass
 
 
 def _prune_remote(sftp, remote_dir, bucket_name, keep):
@@ -229,6 +275,11 @@ def _run_remote_backup(conn, ssh, keep):
 		return
 	try:
 		client, sftp = _connect_sftp(ssh)
+	except ImportError:
+		frappe.log_error(
+			"S3 Backup: paramiko is not installed — run `pip install paramiko` in the bench env. "
+			"Remote backup skipped (existing snapshots untouched).", "S3 Backup")
+		return
 	except Exception:
 		frappe.log_error(
 			frappe.get_traceback(),
@@ -236,6 +287,7 @@ def _run_remote_backup(conn, ssh, keep):
 		return
 	stamp = _stamp()
 	try:
+		_reap_stale_parts(sftp, ssh["directory"])   # reclaim partials from earlier failed runs
 		for bucket_name in _buckets(conn):
 			if _stream_bucket_to_remote(conn, bucket_name, sftp, ssh["directory"], stamp):
 				_prune_remote(sftp, ssh["directory"], bucket_name, keep)

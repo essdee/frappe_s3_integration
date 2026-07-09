@@ -220,6 +220,7 @@ class TestBackup(FrappeTestCase):
 		fake = _FakeRemoteFile()
 		sftp = MagicMock()
 		sftp.open.return_value = fake
+		sftp.stat.side_effect = lambda p: MagicMock(st_size=len(fake.getvalue()))  # full size landed
 		sftp.remove.side_effect = IOError  # no leftover final to replace
 		ok = backup._stream_bucket_to_remote(conn, "bkt", sftp, "/backup", "2026-07-09_10-00-00")
 		self.assertTrue(ok)
@@ -250,6 +251,40 @@ class TestBackup(FrappeTestCase):
 		self.assertFalse(ok)
 		sftp.rename.assert_not_called()
 		self.assertTrue(any(c.args[0].endswith(".part") for c in sftp.remove.call_args_list))
+
+	def test_stream_discards_when_remote_size_short(self):
+		# silent tail truncation (remote disk full on last blocks): remote file smaller than
+		# what we streamed -> snapshot discarded, never renamed to final, history kept.
+		conn = self._stream_conn({"files/a.txt": b"abc", "files/b.txt": b"hello"})
+		fake = _FakeRemoteFile()
+		sftp = MagicMock()
+		sftp.open.return_value = fake
+		sftp.stat.side_effect = lambda p: MagicMock(st_size=len(fake.getvalue()) - 3)  # 3 bytes lost
+		with patch.object(backup.frappe, "log_error"):
+			ok = backup._stream_bucket_to_remote(conn, "bkt", sftp, "/backup", "STAMP")
+		self.assertFalse(ok)
+		sftp.rename.assert_not_called()   # never enshrine a truncated snapshot as good
+		self.assertTrue(any(str(c.args[0]).endswith(".part") for c in sftp.remove.call_args_list))
+
+	def test_remote_backup_reaps_stale_parts(self):
+		# leftover .part from an earlier killed run is reclaimed at the start of the next run.
+		conn = MagicMock()
+		conn.private_bucket, conn.public_bucket = "prv", None
+		sftp = MagicMock()
+		sftp.listdir.return_value = ["prv-old.tar.gz.part", "prv-2026-07-01.tar.gz", "keep.txt"]
+		with patch.object(backup, "_connect_sftp", return_value=(MagicMock(), sftp)), \
+		     patch.object(backup, "_stream_bucket_to_remote", return_value=False), \
+		     patch.object(backup.frappe, "log_error"):
+			backup._run_remote_backup(conn, {"user": "u", "password": "p", "directory": "/d"}, 5)
+		removed = [c.args[0] for c in sftp.remove.call_args_list]
+		self.assertIn("/d/prv-old.tar.gz.part", removed)        # stale partial reaped
+		self.assertNotIn("/d/prv-2026-07-01.tar.gz", removed)   # real snapshot untouched
+
+	def test_remote_backup_clear_message_when_paramiko_missing(self):
+		with patch.object(backup, "_connect_sftp", side_effect=ImportError("No module named paramiko")), \
+		     patch.object(backup.frappe, "log_error") as le:
+			backup._run_remote_backup(MagicMock(), {"user": "u", "password": "p", "directory": "/d"}, 5)
+		self.assertIn("paramiko", " ".join(str(c.args[0]) for c in le.call_args_list))
 
 	def test_prune_remote_keeps_newest_n(self):
 		sftp = MagicMock()
