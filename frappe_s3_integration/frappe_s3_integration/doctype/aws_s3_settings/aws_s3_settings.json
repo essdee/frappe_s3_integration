@@ -12,7 +12,13 @@
   "s3_bucket_details",
   "enable_bucket_backup",
   "backup_directory",
-  "backup_retention_count"
+  "backup_retention_count",
+  "backup_remote_section",
+  "backup_ssh_host",
+  "backup_ssh_port",
+  "backup_ssh_user",
+  "backup_ssh_password",
+  "backup_ssh_directory"
  ],
  "fields": [
   {
@@ -60,14 +66,47 @@
    "default": "7",
    "fieldname": "backup_retention_count",
    "fieldtype": "Int",
-   "label": "Backup Retention (archives per bucket)"
+   "label": "Backup Retention (snapshots per bucket)"
+  },
+  {
+   "fieldname": "backup_remote_section",
+   "fieldtype": "Section Break",
+   "label": "Remote Backup over SSH (leave host blank to keep backups local)"
+  },
+  {
+   "description": "Hostname/IP of the other computer that stores the backups. When set, snapshots are pushed there over SSH/SFTP instead of local disk.",
+   "fieldname": "backup_ssh_host",
+   "fieldtype": "Data",
+   "label": "SSH Host"
+  },
+  {
+   "default": "22",
+   "fieldname": "backup_ssh_port",
+   "fieldtype": "Int",
+   "label": "SSH Port"
+  },
+  {
+   "fieldname": "backup_ssh_user",
+   "fieldtype": "Data",
+   "label": "SSH User"
+  },
+  {
+   "fieldname": "backup_ssh_password",
+   "fieldtype": "Password",
+   "label": "SSH Password"
+  },
+  {
+   "description": "Absolute directory on the other computer to store snapshots (the SSH user must be able to write here).",
+   "fieldname": "backup_ssh_directory",
+   "fieldtype": "Data",
+   "label": "SSH Directory"
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2025-12-15 09:44:55.471046",
+ "modified": "2026-07-09 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "Frappe S3 Integration",
  "name": "AWS S3 Settings",

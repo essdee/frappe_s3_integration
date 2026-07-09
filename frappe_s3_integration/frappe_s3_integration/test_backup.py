@@ -1,7 +1,9 @@
 # Copyright (c) 2026, sakthi123msd@gmail.com and Contributors
 # See license.txt
 
+import io
 import os
+import sys
 import tarfile
 import tempfile
 from unittest.mock import MagicMock, patch
@@ -9,6 +11,15 @@ from unittest.mock import MagicMock, patch
 from frappe.tests.utils import FrappeTestCase
 
 from frappe_s3_integration.frappe_s3_integration import backup
+
+
+class _FakeRemoteFile(io.BytesIO):
+	"""Stand-in for a paramiko SFTPFile: a real buffer we can inspect, plus set_pipelined()."""
+	def set_pipelined(self, value):
+		pass
+
+	def close(self):
+		pass  # keep the buffer readable after the tar stream closes
 
 
 class TestBackup(FrappeTestCase):
@@ -157,6 +168,125 @@ class TestBackup(FrappeTestCase):
 		with patch.object(backup, "getS3Connection", return_value=conn):
 			backup.run_backup_s3_buckets()
 		conn.list_objects.assert_not_called()
+
+	# ---- remote SSH-push backup (snapshots to another computer) --------------------------
+	def test_ssh_settings_none_when_host_blank(self):
+		s = MagicMock()
+		s.get.side_effect = lambda k, *a: ""
+		self.assertIsNone(backup._ssh_settings(s))
+
+	def test_ssh_settings_reads_encrypted_password(self):
+		s = MagicMock()
+		s.get.side_effect = {"backup_ssh_host": "box", "backup_ssh_port": 2222,
+		                     "backup_ssh_user": "u", "backup_ssh_directory": "/backup"}.get
+		s.get_password.return_value = "secret"
+		out = backup._ssh_settings(s)
+		self.assertEqual(out, {"host": "box", "port": 2222, "user": "u",
+		                       "password": "secret", "directory": "/backup"})
+		s.get_password.assert_called_once_with("backup_ssh_password", raise_exception=False)
+
+	def test_run_backup_routes_to_remote_when_ssh_set(self):
+		conn = MagicMock()
+		conn.s3_settings.disable_s3_operations = 0
+		conn.s3_settings.get.side_effect = {"enable_bucket_backup": 1, "backup_retention_count": 5}.get
+		with patch.object(backup, "getS3Connection", return_value=conn), \
+		     patch.object(backup, "_ssh_settings", return_value={"host": "box"}), \
+		     patch.object(backup, "_run_remote_backup") as rr, \
+		     patch.object(backup, "_run_local_backup") as rl:
+			backup.run_backup_s3_buckets()
+		rr.assert_called_once()
+		rl.assert_not_called()
+
+	def test_run_backup_routes_to_local_when_no_ssh(self):
+		conn = MagicMock()
+		conn.s3_settings.disable_s3_operations = 0
+		conn.s3_settings.get.side_effect = {"enable_bucket_backup": 1}.get
+		with patch.object(backup, "getS3Connection", return_value=conn), \
+		     patch.object(backup, "_ssh_settings", return_value=None), \
+		     patch.object(backup, "_run_remote_backup") as rr, \
+		     patch.object(backup, "_run_local_backup") as rl:
+			backup.run_backup_s3_buckets()
+		rl.assert_called_once()
+		rr.assert_not_called()
+
+	def _stream_conn(self, blobs):
+		conn = MagicMock()
+		conn.list_objects.return_value = [{"Key": k, "Size": len(v)} for k, v in blobs.items()]
+		conn.get_file_from_bucket.side_effect = lambda key, bucket: {"Body": io.BytesIO(blobs[key])}
+		return conn
+
+	def test_stream_bucket_writes_valid_tar_and_renames(self):
+		conn = self._stream_conn({"files/a.txt": b"abc", "files/b.txt": b"hello"})
+		fake = _FakeRemoteFile()
+		sftp = MagicMock()
+		sftp.open.return_value = fake
+		sftp.remove.side_effect = IOError  # no leftover final to replace
+		ok = backup._stream_bucket_to_remote(conn, "bkt", sftp, "/backup", "2026-07-09_10-00-00")
+		self.assertTrue(ok)
+		# wrote to a .part then renamed to the final snapshot name
+		self.assertTrue(sftp.open.call_args.args[0].endswith("bkt-2026-07-09_10-00-00.tar.gz.part"))
+		src, dst = sftp.rename.call_args.args
+		self.assertTrue(src.endswith(".part") and dst.endswith("bkt-2026-07-09_10-00-00.tar.gz"))
+		# the streamed bytes are a valid gzip tar containing both objects
+		with tarfile.open(fileobj=io.BytesIO(fake.getvalue()), mode="r:gz") as t:
+			self.assertEqual(sorted(m.name for m in t.getmembers()),
+			                 ["bkt/files/a.txt", "bkt/files/b.txt"])
+			self.assertEqual(t.extractfile("bkt/files/a.txt").read(), b"abc")
+
+	def test_stream_bucket_incomplete_discards_partial(self):
+		# an object failing mid-stream -> no rename, partial removed, previous snapshots kept.
+		conn = MagicMock()
+		conn.list_objects.return_value = [{"Key": "files/a.txt", "Size": 3}, {"Key": "files/b.txt", "Size": 5}]
+
+		def get_file(key, bucket):
+			if key == "files/b.txt":
+				raise Exception("S3 down mid-stream")
+			return {"Body": io.BytesIO(b"abc")}
+		conn.get_file_from_bucket.side_effect = get_file
+		sftp = MagicMock()
+		sftp.open.return_value = _FakeRemoteFile()
+		with patch.object(backup.frappe, "log_error"):
+			ok = backup._stream_bucket_to_remote(conn, "bkt", sftp, "/backup", "STAMP")
+		self.assertFalse(ok)
+		sftp.rename.assert_not_called()
+		self.assertTrue(any(c.args[0].endswith(".part") for c in sftp.remove.call_args_list))
+
+	def test_prune_remote_keeps_newest_n(self):
+		sftp = MagicMock()
+		sftp.listdir.return_value = (
+			[f"bkt-2026-07-0{d}.tar.gz" for d in range(1, 6)] + ["bkt-x.tar.gz.part", "other.txt"])
+		with patch.object(backup.frappe, "log_error"):
+			backup._prune_remote(sftp, "/backup", "bkt", keep=2)
+		removed = [c.args[0] for c in sftp.remove.call_args_list]
+		self.assertEqual(len(removed), 3)                       # 5 snapshots, keep 2 -> remove 3 oldest
+		self.assertTrue(all(r.endswith(".tar.gz") for r in removed))  # never the .part / other files
+
+	def test_remote_backup_skips_when_creds_missing(self):
+		with patch.object(backup, "_connect_sftp") as cs, patch.object(backup.frappe, "log_error") as le:
+			backup._run_remote_backup(MagicMock(), {"user": "", "password": "", "directory": ""}, 5)
+		cs.assert_not_called()
+		le.assert_called_once()
+
+	def test_remote_backup_skips_on_connect_failure(self):
+		with patch.object(backup, "_connect_sftp", side_effect=Exception("host key unknown")), \
+		     patch.object(backup.frappe, "log_error") as le:
+			backup._run_remote_backup(MagicMock(), {"user": "u", "password": "p", "directory": "/d"}, 5)
+		le.assert_called()
+
+	def test_connect_sftp_password_only_and_verifies_host_key(self):
+		fake_paramiko = MagicMock()
+		client = MagicMock()
+		fake_paramiko.SSHClient.return_value = client
+		with patch.dict(sys.modules, {"paramiko": fake_paramiko}), \
+		     patch.object(backup.frappe, "conf", {}):
+			c, sftp = backup._connect_sftp({"host": "box", "port": 22, "user": "u", "password": "p"})
+		kw = client.connect.call_args.kwargs
+		self.assertEqual(kw["password"], "p")
+		self.assertFalse(kw["look_for_keys"])         # password auth only — never a key/agent
+		self.assertFalse(kw["allow_agent"])
+		client.load_system_host_keys.assert_called_once()
+		client.set_missing_host_key_policy.assert_called_once()   # RejectPolicy (autoadd off) = MITM-safe
+		fake_paramiko.RejectPolicy.assert_called_once()
 
 	def test_entry_enqueues_long_queue_3h_dedup(self):
 		# Downloading whole buckets can take a long time -> long queue + 3h timeout.
