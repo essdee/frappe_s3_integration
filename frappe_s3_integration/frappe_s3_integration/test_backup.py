@@ -114,6 +114,13 @@ if HAS_PARAMIKO:
 				return paramiko.SFTPServer.convert_errno(e.errno)
 			return paramiko.SFTP_OK
 
+		def mkdir(self, path, attr):
+			try:
+				os.mkdir(self._real(path))
+			except OSError as e:
+				return paramiko.SFTPServer.convert_errno(e.errno)
+			return paramiko.SFTP_OK
+
 
 @unittest.skipUnless(HAS_PARAMIKO, "paramiko not installed")
 class TestBackupSSHIntegration(FrappeTestCase):
@@ -203,6 +210,17 @@ class TestBackupSSHIntegration(FrappeTestCase):
 		finally:
 			sftp.close()
 			client.close()
+
+	def test_full_run_creates_missing_per_site_directory(self):
+		# multi-site: each site names its own subfolder; the code mkdir -p's it on demand.
+		conn = self._s3_conn({"files/a.txt": b"alpha"})
+		ssh = self._ssh()
+		ssh["directory"] = "/backups/erp"                       # does not exist yet on the box
+		backup._run_remote_backup(conn, ssh, keep=3)
+		site_dir = os.path.join(self.root, "backups", "erp")
+		self.assertTrue(os.path.isdir(site_dir))                # created for us
+		snaps = [f for f in os.listdir(site_dir) if f.endswith(".tar.gz")]
+		self.assertEqual(len(snaps), 1)                         # snapshot landed in the site's folder
 
 	def test_full_run_reaps_stale_part_and_writes_snapshot(self):
 		# the whole _run_remote_backup path (connect -> reap -> stream -> prune -> close).

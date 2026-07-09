@@ -269,6 +269,24 @@ def _prune_remote(sftp, remote_dir, bucket_name, keep):
 			frappe.log_error(f"Failed to prune remote snapshot: {n}", "S3 Backup")
 
 
+def _ensure_remote_dir(sftp, directory):
+	"""mkdir -p the remote backup directory so each site's path is created on demand — the
+	operator only names one directory per site (e.g. /backups/erp) and never hand-creates it,
+	and a missing directory can't crash the job."""
+	if not directory:
+		return
+	cur = "/" if directory.startswith("/") else ""
+	for part in [p for p in directory.split("/") if p]:
+		cur = (cur + part) if cur in ("/", "") else (cur + "/" + part)
+		try:
+			sftp.stat(cur)
+		except Exception:
+			try:
+				sftp.mkdir(cur)
+			except Exception:
+				pass  # already created concurrently, or a parent perms issue surfaced below
+
+
 def _run_remote_backup(conn, ssh, keep):
 	if not (ssh["user"] and ssh["password"] and ssh["directory"]):
 		frappe.log_error("S3 Backup: SSH host set but user/password/directory missing — skipped", "S3 Backup")
@@ -287,10 +305,15 @@ def _run_remote_backup(conn, ssh, keep):
 		return
 	stamp = _stamp()
 	try:
-		_reap_stale_parts(sftp, ssh["directory"])   # reclaim partials from earlier failed runs
+		_ensure_remote_dir(sftp, ssh["directory"])   # per-site directory, created on demand
+		_reap_stale_parts(sftp, ssh["directory"])    # reclaim partials from earlier failed runs
 		for bucket_name in _buckets(conn):
-			if _stream_bucket_to_remote(conn, bucket_name, sftp, ssh["directory"], stamp):
-				_prune_remote(sftp, ssh["directory"], bucket_name, keep)
+			try:
+				if _stream_bucket_to_remote(conn, bucket_name, sftp, ssh["directory"], stamp):
+					_prune_remote(sftp, ssh["directory"], bucket_name, keep)
+			except Exception:
+				# one bucket erroring must not abort the other bucket or crash the job
+				frappe.log_error(frappe.get_traceback(), f"S3 Backup: bucket {bucket_name} failed")
 	finally:
 		for c in (sftp, client):
 			try:
