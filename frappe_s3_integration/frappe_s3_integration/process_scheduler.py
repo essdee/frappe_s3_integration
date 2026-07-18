@@ -37,12 +37,18 @@ def _local_path(file):
 
 
 def _other_unmigrated_share(file):
-	"""True if another File with the same physical blob still needs the local bytes (M1)."""
+	"""True if another File with the same physical blob still needs the local bytes (M1).
+
+	Only a sibling that is actually GOING to migrate may hold the blob back. A row that
+	was never flagged (inserted while disable_s3_operations was on) will never migrate,
+	so without the custom_is_s3_uploaded filter it would block the delete forever."""
 	if not file.content_hash:
 		return False
 	return bool(frappe.get_all("File", filters={
 		"content_hash": file.content_hash, "is_private": file.is_private,
-		"name": ["!=", file.name], "custom_s3_key": ["in", ["", None]],
+		"name": ["!=", file.name],
+		"custom_is_s3_uploaded": 1,
+		"custom_s3_key": ["in", ["", None]],
 	}, limit=1))
 
 
