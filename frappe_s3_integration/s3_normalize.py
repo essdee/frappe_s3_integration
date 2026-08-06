@@ -464,6 +464,9 @@ def _backfill_attached_fields(dry_run=0):
 		filters=ATTACH_BACKFILL_FILTERS,
 		fields=["name", "file_name", "custom_s3_key",
 		        "attached_to_doctype", "attached_to_name", "attached_to_field"],
+		# Replacement attachments leave the old File row linked to the same target.
+		# Process the newest row first so a shared stale URL can never make the oldest win.
+		order_by="creation desc, name desc",
 	)
 
 	repointed = skipped = errors = 0
