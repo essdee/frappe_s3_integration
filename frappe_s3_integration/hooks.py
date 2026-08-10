@@ -253,7 +253,8 @@ fixtures = [
 ]
 
 override_doctype_class = {
-    "File": "frappe_s3_integration.overrides.S3File"
+    "File": "frappe_s3_integration.overrides.S3File",
+    "Prepared Report": "frappe_s3_integration.prepared_report.S3PreparedReport",
 }
 
 
