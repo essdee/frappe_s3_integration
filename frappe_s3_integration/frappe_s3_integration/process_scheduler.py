@@ -1,5 +1,6 @@
 import hashlib
 import os
+import re
 from urllib.parse import unquote
 
 import frappe
@@ -36,6 +37,37 @@ def _local_path(file):
 	if not path.startswith(os.path.normpath(base) + os.sep):
 		return None  # traversal attempt
 	return path
+
+
+def _local_path_for_migration(file):
+	"""Resolve a local blob without guessing its contents.
+
+	Some legacy File rows retained the pre-collision URL even though Frappe wrote the
+	file with the last six characters of its content hash appended to the basename.
+	Only accept a fallback path when its bytes match the row's full content_hash.
+	"""
+	local_path = _local_path(file)
+	if not local_path or os.path.isfile(local_path):
+		return local_path
+
+	content_hash = (file.content_hash or "").lower()
+	if len(content_hash) != 32 or any(ch not in "0123456789abcdef" for ch in content_hash):
+		return local_path
+
+	parent = os.path.dirname(local_path)
+	candidates = []
+	if file.file_name:
+		safe_file_name = re.sub(r"[/\\%?#]", "_", file.file_name)
+		candidates.append(os.path.join(parent, safe_file_name))
+	root, ext = os.path.splitext(local_path)
+	candidates.append(f"{root}{content_hash[-6:]}{ext}")
+
+	for candidate in dict.fromkeys(candidates):
+		if os.path.dirname(os.path.normpath(candidate)) != os.path.normpath(parent):
+			continue
+		if os.path.isfile(candidate) and _hash_local_file(candidate).lower() == content_hash:
+			return candidate
+	return local_path
 
 
 def _other_unmigrated_share(file):
@@ -220,7 +252,7 @@ def migrate_file_to_s3(file_name, conn):
 	if file.custom_s3_key:
 		return  # already migrated — idempotent (invariant 2)
 
-	local_path = _local_path(file)
+	local_path = _local_path_for_migration(file)
 
 	# Local bytes gone: heal from a migrated sibling sharing the blob (N1) — never lose the
 	# pointer. Match ONLY by content_hash (byte-safe); a shared url is NOT proof of shared
