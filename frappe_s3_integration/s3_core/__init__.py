@@ -5,7 +5,8 @@ import mimetypes
 import os
 import re
 import unicodedata
-from urllib.parse import quote
+from urllib.parse import quote, unquote
+
 import boto3 as s3
 import frappe
 from botocore.exceptions import ClientError
@@ -39,10 +40,12 @@ def _s3_key_from_file_url(file_url):
 	"""Map a local File url to its S3 key, mirroring Frappe's own on-disk layout:
 	'/files/x.pdf' -> 'files/x.pdf', '/private/files/x.pdf' -> 'private/files/x.pdf'.
 	Returns None if it isn't a local /files path (traversal-safe)."""
-	url = (file_url or "").split("?", 1)[0]
+	url = (file_url or "").split("?", 1)[0].split("#", 1)[0]
 	if not (url.startswith("/files/") or url.startswith("/private/files/")):
 		return None
-	parts = [p for p in url.split("/") if p and p not in (".", "..")]
+	parts = [p for p in unquote(url).split("/") if p]
+	if any(part in (".", "..") for part in parts):
+		return None
 	return "/".join(parts)
 
 

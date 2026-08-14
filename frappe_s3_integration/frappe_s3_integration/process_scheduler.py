@@ -1,5 +1,6 @@
 import hashlib
 import os
+from urllib.parse import unquote
 
 import frappe
 from frappe.utils import get_site_path
@@ -23,13 +24,14 @@ def _hash_local_file(path):
 def _local_path(file):
 	"""Deterministic local path for a /files or /private/files url; None otherwise.
 	Avoids get_file_path's name-matching ambiguity (N11) and path traversal (N10)."""
-	url = file.file_url or ""
+	url = (file.file_url or "").split("?", 1)[0].split("#", 1)[0]
 	if url.startswith("/private/files/"):
 		rel, base = url[len("/private/files/"):], get_site_path("private", "files")
 	elif url.startswith("/files/"):
 		rel, base = url[len("/files/"):], get_site_path("public", "files")
 	else:
 		return None
+	rel = unquote(rel)
 	path = os.path.normpath(os.path.join(base, rel))
 	if not path.startswith(os.path.normpath(base) + os.sep):
 		return None  # traversal attempt
