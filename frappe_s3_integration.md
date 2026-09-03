@@ -653,6 +653,28 @@ buckets = conn.get_bucket_list()
 
 ## Configuration Guide
 
+### Developer-mode S3 safety
+
+Sites with `developer_mode` enabled are denied S3 operations by default. This
+protects a locally restored production database from uploading, replacing, or
+deleting objects in the production buckets. Local File documents can still be
+deleted; their remote S3 objects are deliberately left untouched.
+
+Only add the following site-local opt-in when a developer site intentionally
+needs to operate on its configured buckets:
+
+```json
+{
+  "developer_mode": 1,
+  "s3_allow_operations": 1
+}
+```
+
+Restart the site's web and worker processes after changing this site config.
+The `Disable S3 Operations` switch in AWS S3 Settings remains authoritative: if
+that switch is enabled, S3 stays disabled even when `s3_allow_operations` is
+set.
+
 ### Step 1: Install the App
 
 ```bash
