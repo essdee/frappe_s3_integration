@@ -25,7 +25,8 @@ class TestDeleteGuard(FrappeTestCase):
 		conn = MagicMock()
 		conn.s3_settings.disable_s3_operations = disabled
 		conn.delete_file_from_bucket.return_value = delete_res
-		with patch(f"{PKG}.getS3Connection", return_value=conn) as gc, \
+		with patch(f"{PKG}.developer_mode_s3_operations_blocked", return_value=False), \
+		     patch(f"{PKG}.getS3Connection", return_value=conn) as gc, \
 		     patch(f"{PKG}.frappe.db.count", return_value=other_refs) as cnt:
 			s3_core.delete_file_from_s3(doc, "on_trash")
 		return conn, gc, cnt

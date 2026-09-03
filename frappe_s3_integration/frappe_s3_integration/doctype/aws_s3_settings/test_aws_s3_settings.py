@@ -197,13 +197,15 @@ class TestFlagFile(FrappeTestCase):
 
 	def test_flags_local_file(self):
 		doc = self._doc()
-		with patch.object(s3_core.frappe.db, "get_single_value", return_value=0):
+		with patch.object(s3_core.frappe.db, "get_single_value", return_value=0), \
+		     patch.object(s3_core, "developer_mode_s3_operations_blocked", return_value=False):
 			s3_core.flag_file_for_s3(doc)
 		doc.db_set.assert_called_once_with("custom_is_s3_uploaded", 1, update_modified=False)
 
 	def test_flags_public_local_file(self):
 		doc = self._doc(file_url="/files/a.png")
-		with patch.object(s3_core.frappe.db, "get_single_value", return_value=0):
+		with patch.object(s3_core.frappe.db, "get_single_value", return_value=0), \
+		     patch.object(s3_core, "developer_mode_s3_operations_blocked", return_value=False):
 			s3_core.flag_file_for_s3(doc)
 		doc.db_set.assert_called_once_with("custom_is_s3_uploaded", 1, update_modified=False)
 

@@ -10,6 +10,34 @@ from urllib.parse import quote, unquote
 import boto3 as s3
 import frappe
 from botocore.exceptions import ClientError
+from frappe.utils import cint
+
+
+def developer_mode_s3_operations_blocked():
+	"""Protect copied/restored databases from mutating their source S3 buckets.
+
+	Developer sites must opt in explicitly with ``s3_allow_operations`` in their
+	site config. Production sites (developer mode off) retain their existing S3
+	behaviour.
+	"""
+	return bool(cint(frappe.conf.get("developer_mode"))) and not bool(
+		cint(frappe.conf.get("s3_allow_operations"))
+	)
+
+
+def s3_operations_allowed(settings=None):
+	"""Return whether this site may make S3 requests, failing closed on errors."""
+	if developer_mode_s3_operations_blocked():
+		return False
+	try:
+		disabled = (
+			settings.get("disable_s3_operations")
+			if settings is not None
+			else frappe.db.get_single_value("AWS S3 Settings", "disable_s3_operations")
+		)
+		return not bool(cint(disabled))
+	except Exception:
+		return False
 
 
 def _guess_content_type(filename):
@@ -89,7 +117,11 @@ class S3Connection:
 	def __init__(self, *args, **kwargs):
 		self.connection = None
 		self.setup_s3_settings()
-		if self.s3_settings.disable_s3_operations:
+		self.operations_allowed = s3_operations_allowed(self.s3_settings)
+		if not self.operations_allowed:
+			# Keep every existing downstream kill-switch check effective without
+			# persisting a change to AWS S3 Settings.
+			self.s3_settings.disable_s3_operations = 1
 			return
 		if not self.s3_settings.aws_key or not self.s3_settings.aws_secret:
 			frappe.throw("Please set AWS Access Key ID and Secret Access Key in S3 Settings")
@@ -101,6 +133,16 @@ class S3Connection:
 			aws_secret_access_key=self.s3_settings.get_password('aws_secret'),
 			region_name=self.s3_settings.get('region'),
 		)
+
+	def ensure_operations_allowed(self):
+		"""Raise before an S3 mutation when this connection is safety-blocked."""
+		if getattr(self, "operations_allowed", True) is False:
+			frappe.throw(
+				"S3 operations are disabled for this developer site. "
+				"Set s3_allow_operations to 1 in site_config.json to opt in explicitly."
+			)
+		if getattr(self, "s3_settings", None) and self.s3_settings.disable_s3_operations:
+			frappe.throw("S3 operations are disabled")
 
 	def setup_s3_settings(self):
 		self.s3_settings = frappe.get_single("AWS S3 Settings")
@@ -192,6 +234,7 @@ class S3Connection:
 		"""
 		Create a new S3 bucket.
 		"""
+		self.ensure_operations_allowed()
 		try:
 			self.connection.create_bucket(Bucket=bucket_name)
 			return True
@@ -203,6 +246,7 @@ class S3Connection:
 		"""
 		Delete an S3 bucket.
 		"""
+		self.ensure_operations_allowed()
 		try:
 			self.connection.delete_bucket(Bucket=bucket_name)
 			return True
@@ -253,6 +297,7 @@ class S3Connection:
 		"""Upload a file to an S3 bucket. `key` is the object key; when omitted it mirrors
 		Frappe's own layout — files/<name> (public) / private/files/<name> (private) — with
 		a collision-safe suffix, so the S3 path matches how Frappe stores the file."""
+		self.ensure_operations_allowed()
 		if not bucket_name:
 			frappe.throw("Please provide a bucket name")
 		# Validate non-empty + compute content hash WITHOUT loading the whole file in memory
@@ -335,7 +380,7 @@ class S3Connection:
 		
 
 	def update_file_in_bucket(self, file, bucket_name, key, allow_public=False, content_type=None):
-		
+		self.ensure_operations_allowed()
 		extra_args = {"ContentType": content_type or _guess_content_type(key)}
 		if allow_public:
 			extra_args["ACL"] = "public-read"
@@ -350,6 +395,7 @@ class S3Connection:
 		"""Server-side copy into another bucket (visibility toggle). Mirror Frappe: the
 		object moves between files/ and private/files/ keeping its filename, so the name
 		is stable across public<->private flips."""
+		self.ensure_operations_allowed()
 		basename = src_key.rsplit("/", 1)[-1] or _s3_safe_filename(filename)
 		prefix = "files" if make_public else "private/files"
 		new_key = f"{prefix}/{basename}"
@@ -367,6 +413,7 @@ class S3Connection:
 		"""
 		Delete a file from an S3 bucket.
 		"""
+		self.ensure_operations_allowed()
 		if not bucket_name:
 			frappe.throw("Please provide a bucket name")
 		try:
@@ -437,7 +484,7 @@ def flag_file_for_s3(doc, event=None, *args):
 	if not (file_url.startswith("/files/") or file_url.startswith("/private/files/")):
 		return
 	try:
-		if frappe.db.get_single_value("AWS S3 Settings", "disable_s3_operations"):
+		if not s3_operations_allowed():
 			return
 	except Exception:
 		return
@@ -505,6 +552,11 @@ def delete_file_from_s3(doc, event, *args):
 		return
 	key = doc.get('custom_s3_key', None)
 	if not key:
+		return
+	# A restored developer database may still point at production objects. Let the
+	# local File row be deleted, but never propagate that deletion to S3 unless the
+	# developer explicitly opted in through site_config.json.
+	if developer_mode_s3_operations_blocked():
 		return
 	# Skip S3 deletion if other File docs still reference the same object (shared blob).
 	other_refs = frappe.db.count("File", filters={
