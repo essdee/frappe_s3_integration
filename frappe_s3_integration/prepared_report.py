@@ -41,7 +41,10 @@ class S3PreparedReport(PreparedReport):
                 title=_("Attachment Not Found"),
             )
 
-        content = frappe.get_doc("File", attachment.name).get_content()
+        # Prepared Report attachments are gzip streams, never text. Passing an
+        # empty encoding list prevents core File.get_content() from decoding the
+        # bytes as Windows-1252 and a later UTF-8 encode corrupting the stream.
+        content = frappe.get_doc("File", attachment.name).get_content(encodings=())
         if isinstance(content, str):
             content = content.encode()
         try:

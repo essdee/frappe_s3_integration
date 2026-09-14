@@ -26,7 +26,7 @@ class S3File(File):
 			return
 		return super().validate_file_on_disk()
 
-	def get_content(self) -> bytes:
+	def get_content(self, encodings=None) -> bytes | str:
 		# S3-backed files have no local copy; fetch the bytes from S3 instead of
 		# open()ing the proxy url. Mirrors core's decode-to-str-if-text behaviour.
 		if not self.get("content") and self.get("custom_is_s3_uploaded") and self.get("custom_s3_key"):
@@ -37,9 +37,11 @@ class S3File(File):
 				frappe.throw(_("S3 file access is temporarily disabled"))
 			obj = conn.get_file_from_bucket(self.custom_s3_key, self.custom_s3_bucket_name)
 			self._content = obj["Body"].read()
+			if encodings == ():
+				return self._content
 			try:
 				self._content = self._content.decode()
 			except UnicodeDecodeError:
 				pass  # binary (xlsx, png, …) stays bytes
 			return self._content
-		return super().get_content()
+		return super().get_content(encodings=encodings)

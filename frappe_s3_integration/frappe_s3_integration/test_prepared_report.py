@@ -42,6 +42,7 @@ class TestS3PreparedReport(FrappeTestCase):
 
         self.assertEqual(data, payload)
         self.assertEqual(file_name, "report.json.gz")
+        file_doc.get_content.assert_called_once_with(encodings=())
 
     def test_file_name_is_authoritative_when_proxy_shape_changes(self):
         attachment = frappe._dict(
@@ -80,3 +81,29 @@ class TestS3PreparedReport(FrappeTestCase):
 
         self.assertIsInstance(content, bytes)
         self.assertEqual(gzip.decompress(content), b'{"result":[]}')
+
+    def test_s3_file_raw_read_does_not_decode_binary_content(self):
+        compressed = gzip.compress(b'{"result":[]}', mtime=0)
+        doc = S3File(
+            {
+                "doctype": "File",
+                "file_name": "report.json.gz",
+                "custom_is_s3_uploaded": 1,
+                "custom_s3_key": "private/files/report.json.gz",
+                "custom_s3_bucket_name": "private-bucket",
+            }
+        )
+        connection = MagicMock()
+        connection.s3_settings.disable_s3_operations = 0
+        connection.get_file_from_bucket.return_value = {
+            "Body": MagicMock(read=lambda: compressed)
+        }
+
+        with patch(
+            "frappe_s3_integration.s3_core.getS3Connection",
+            return_value=connection,
+        ):
+            content = doc.get_content(encodings=())
+
+        self.assertIsInstance(content, bytes)
+        self.assertEqual(content, compressed)
