@@ -19,6 +19,25 @@ def _guess_content_type(filename):
 	return mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
 
+_FILE_SIGNATURES = (
+	(b"\xff\xd8\xff", "image/jpeg", ".jpg"),
+	(b"\x89PNG\r\n\x1a\n", "image/png", ".png"),
+	(b"GIF87a", "image/gif", ".gif"),
+	(b"GIF89a", "image/gif", ".gif"),
+	(b"%PDF-", "application/pdf", ".pdf"),
+)
+
+
+def _sniff_content_type(head):
+	"""MIME type and extension from the first bytes of a file, or (None, None)."""
+	for signature, content_type, extension in _FILE_SIGNATURES:
+		if head.startswith(signature):
+			return content_type, extension
+	if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+		return "image/webp", ".webp"
+	return None, None
+
+
 def _s3_safe_filename(filename, fallback="file"):
 	"""S3-safe BASENAME that preserves the uploaded name as closely as possible
 	while guaranteeing no path traversal and a valid, length-capped key segment."""
@@ -639,22 +658,28 @@ def _stream_from_s3(file_doc):
 			raise frappe.exceptions.NotFound
 		raise
 
+	body = s3_obj["Body"]
+	first_chunk = body.read(8192)
+	file_name = file_doc.file_name or ""
+
 	content_type = s3_obj.get("ContentType")
 	if not content_type or content_type in ("binary/octet-stream", "application/octet-stream"):
-		content_type = mimetypes.guess_type(file_doc.file_name)[0] or "application/octet-stream"
+		content_type = mimetypes.guess_type(file_name)[0]
+	if not content_type:
+		content_type, extension = _sniff_content_type(first_chunk)
+		if extension and not os.path.splitext(file_name)[1]:
+			file_name += extension
 
 	from werkzeug.wrappers import Response
 
 	def stream_body():
-		body = s3_obj["Body"]
-		while True:
-			chunk = body.read(8192)
-			if not chunk:
-				break
+		chunk = first_chunk
+		while chunk:
 			yield chunk
+			chunk = body.read(8192)
 
-	response = Response(stream_body(), content_type=content_type)
-	response.headers["Content-Disposition"] = f'inline; filename="{file_doc.file_name}"'
+	response = Response(stream_body(), content_type=content_type or "application/octet-stream")
+	response.headers["Content-Disposition"] = f'inline; filename="{file_name}"'
 	return response
 
 
